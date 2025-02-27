@@ -1002,9 +1002,6 @@ boot_script_() {
 	cat << 'EOF' > /root/.boot-script.sh
 #!/bin/bash
 
-# Wait for the network to be fully ready
-sleep 120s
-
 ## Text colors and styles
 info() {
 	echo -e "\e[92m$1\e[0m"
@@ -1238,7 +1235,6 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/root/.boot-script.sh
-RemainAfterExit=true
 
 [Install]
 WantedBy=multi-user.target
