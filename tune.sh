@@ -600,9 +600,19 @@ set_txqueuelen_() {
 }
 #Initial Congestion Window
 set_initial_congestion_window_() {
-    iproute=$(ip -o -4 route show to default)
-    ip route change $iproute initcwnd 100 initrwnd 100
-	return 0
+    # Get and set the initial congestion window
+    echo "Setting initial congestion window..."
+    
+    # Use a simple command to get and modify the default route in one go
+    ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100
+    
+    # Verify the result
+    if [ $? -ne 0 ]; then
+        echo "Failed to set initial congestion window"
+        return 1
+    fi
+    
+    return 0
 }
 #Kernel Settings
 kernel_settings_() {
@@ -721,7 +731,7 @@ net.ipv4.tcp_rfc1337 = 0
 
 # Column-02: packet_drop: Packets dropped.
 # Packet_drop indicates that the NIC is dropping packets due to a lack of backlog space.
-# Solution 1. : Increase the size of the NIC’s backlog
+# Solution 1. : Increase the size of the NIC's backlog
 # The backlog is the number of packets that the NIC can store in its backlog queue.
 # Increase the backlog size to 10000
 net.core.netdev_max_backlog=10000
@@ -750,8 +760,8 @@ net.core.netdev_budget_usecs=8000
 #Congestion window
 # The congestion window is the amount of data that the sender can send before it must wait for an acknowledgment from the receiver.
 # The congestion window is limited by 2 things. 
-#   The receiver’s advertised window size, which is the amount of data that the receiver is willing to accept
-#   And also the size of the sending socket buffer on the sender’s end.
+#   The receiver's advertised window size, which is the amount of data that the receiver is willing to accept
+#   And also the size of the sending socket buffer on the sender's end.
 
 #How to determine the optimal congestion window
 # The optimal congestion window size is determined by the bandwidth-delay product (BDP) of the network.
@@ -816,7 +826,7 @@ net.ipv4.tcp_wmem=$tcp_wmem
 #	automatic tuning of that socket's send buffer size, in which case
 #	this value is ignored.
 
-# Because of the varying internet condition, not every connection is going to reach the optimal congestion window size, and that’s okay.
+# Because of the varying internet condition, not every connection is going to reach the optimal congestion window size, and that's okay.
 # To prevent slow link from using more than necessary amount of memory, we can use the following sysctl settings to enable receive buffer auto-tuning
 net.ipv4.tcp_moderate_rcvbuf = 1
 
@@ -989,32 +999,241 @@ tune_() {
 ## Configue Boot Script
 boot_script_() {
 	touch /root/.boot-script.sh && chmod +x /root/.boot-script.sh
-	cat << EOF > /root/.boot-script.sh
+	cat << 'EOF' > /root/.boot-script.sh
 #!/bin/bash
+
+# Wait for the network to be fully ready
 sleep 120s
-source <(wget -qO- https://raw.githubusercontent.com/jerry048/Tune/main/tune.sh)
-# Check if Seedbox Components is successfully loaded
-if [ \$? -ne 0 ]; then
-	exit 1
-fi
 
+## Text colors and styles
+info() {
+	echo -e "\e[92m$1\e[0m"
+}
+info_2() {
+	echo -e "\e[94m$1\e[0m"
+}
+fail() {
+	echo -e "\e[91m$1\e[0m" 1>&2
+}
+
+## System information retrieval function
+sysinfo_() {
+	# Linux Distro Version
+	if [ -f /etc/os-release ]; then
+		. /etc/os-release
+		os=$NAME
+		ver=$VERSION_ID
+	elif type lsb_release >/dev/null 2>&1; then
+		os=$(lsb_release -si)
+		ver=$(lsb_release -sr)
+	elif [ -f /etc/lsb-release ]; then
+		. /etc/lsb-release
+		os=$DISTRIB_ID
+		ver=$DISTRIB_RELEASE
+	elif [ -f /etc/debian_version ]; then
+		os=Debian
+		ver=$(cat /etc/debian_version)
+	elif [ -f /etc/redhat-release ]; then
+		os=Redhat
+	else
+		os=$(uname -s)
+		ver=$(uname -r)
+	fi
+
+	# Virtualization Technology
+	if [ $(systemd-detect-virt) != "none" ]; then
+		virt_tech=$(systemd-detect-virt)
+	fi
+
+	# Memory Size
+	mem_size=$(free -m | grep Mem | awk '{print $2}')
+
+	# Network interface
+	nic=$(ip addr | grep 'state UP' | awk '{print $2}' | sed 's/.$//' | cut -d'@' -f1 | head -1)
+
+	echo "System Information:"
+	echo "Operating System: $os $ver"
+	echo "Virtualization Technology: $virt_tech"
+	echo "Memory Size: $mem_size MB"
+	echo "Network Interface: $nic"
+	
+	return 0
+}
+
+## Set ring buffer for network interface
+set_ring_buffer_() {
+	echo "Installing necessary tools..."
+	if [ -z $(which ethtool) ]; then
+		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
+			apt-get -y install ethtool >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Ethtool installation failed"
+				return 1
+			fi
+		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
+			yum install ethtool -y >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Ethtool installation failed"
+				return 1
+			fi
+		fi
+	fi
+	
+	echo "Setting receive buffer size..."
+    ethtool -G $nic rx 1024
+	if [ $? -ne 0 ]; then
+		fail "Receive buffer setting failed"
+		return 1
+	fi
+    sleep 1
+	
+	echo "Setting transmit buffer size..."
+    ethtool -G $nic tx 2048
+	if [ $? -ne 0 ]; then
+		fail "Transmit buffer setting failed"
+		return 1
+	fi
+    sleep 1
+	
+	echo "Ring buffer setting completed"
+	return 0
+}
+
+## Disable TSO
+disable_tso_() {
+	echo "Installing necessary tools..."
+	if [ -z $(which ethtool) ]; then
+		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
+			apt-get -y install ethtool >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Ethtool installation failed"
+				return 1
+			fi
+		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
+			yum install ethtool -y >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Ethtool installation failed"
+				return 1
+			fi
+		fi
+	fi
+	
+	echo "Disabling TSO, GSO, GRO..."
+	ethtool -K $nic tso off gso off gro off
+	if [ $? -ne 0 ]; then
+		fail "TSO disabling failed"
+		return 1
+	fi
+	sleep 1
+	
+	echo "TSO disabling completed"
+	return 0
+}
+
+## Set TCP queue length
+set_txqueuelen_() {
+	echo "Installing necessary tools..."
+	if [ -z $(which ifconfig) ]; then
+		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
+			apt-get install net-tools -y >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Net-tools installation failed"
+				return 1
+			fi
+		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
+			yum install net-tools -y >/dev/null 2>&1
+			if [ $? -ne 0 ]; then
+				fail "Net-tools installation failed"
+				return 1
+			fi
+		fi
+	fi
+	
+	echo "Setting transmit queue length to 10000..."
+    ifconfig $nic txqueuelen 10000
+	if [ $? -ne 0 ]; then
+		fail "Transmit queue length setting failed"
+		return 1
+	fi
+    sleep 1
+	
+	echo "Transmit queue length setting completed"
+	return 0
+}
+
+## Set initial congestion window
+set_initial_congestion_window_() {
+    echo "Setting initial congestion window..."
+    
+    # Wait a bit more to ensure network is stable
+    sleep 5
+    
+    # Get the default route and set initcwnd and initrwnd in one command
+    echo "Command: ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100"
+    ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100
+    
+    # Verify result
+    if [ $? -ne 0 ]; then
+        fail "Setting initial congestion window failed"
+        return 1
+    fi
+    
+    echo "Initial congestion window setting completed"
+    return 0
+}
+
+# Main program starts
+echo "============== System Network Optimization Script ==============="
+echo "Starting system network optimization..."
+
+echo "=============== Getting System Information =================="
 sysinfo_
-if [ -z "\$virt_tech" ]; then		#If not a virtual machine
-	set_ring_buffer_
+
+if [ -z "$virt_tech" ]; then    # If not a virtual machine
+    echo "============= Setting Ring Buffer =============="
+    set_ring_buffer_
+    if [ $? -ne 0 ]; then
+        echo "Setting ring buffer failed"
+    else
+        echo "Setting ring buffer succeeded"
+    fi
 else
-	disable_tso_
+    echo "================ Disabling TSO ==================="
+    disable_tso_
+    if [ $? -ne 0 ]; then
+        echo "Disabling TSO failed"
+    else
+        echo "Disabling TSO succeeded"
+    fi
 fi
 
-if [ "\$virt_tech" != "lxc" ]; then		#If not a LXC container
-	set_txqueuelen_
-	set_initial_congestion_window_
+if [ -z "$virt_tech" ] || [ "$virt_tech" != "lxc" ]; then    # If not an LXC container
+    echo "============= Setting Transmit Queue Length ==============="
+    set_txqueuelen_
+    if [ $? -ne 0 ]; then
+        echo "Setting transmit queue length failed"
+    else
+        echo "Setting transmit queue length succeeded"
+    fi
+    
+    echo "============ Setting Initial Congestion Window ==============="
+    set_initial_congestion_window_
+    if [ $? -ne 0 ]; then
+        echo "Setting initial congestion window failed"
+    else
+        echo "Setting initial congestion window succeeded"
+    fi
 fi
+
+echo "============== System Network Optimization Completed ==============="
 EOF
+
 # Configure the script to run during system startup
 cat << EOF > /etc/systemd/system/boot-script.service
 [Unit]
-Description=boot-script
-After=network.target
+Description=System Network Optimization Script
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -1065,7 +1284,8 @@ install_bbrx_() {
     cat << EOF > /etc/systemd/system/bbrinstall.service
 [Unit]
 Description=BBRinstall
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
