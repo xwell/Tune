@@ -577,6 +577,76 @@ disable_tso_() {
 	sleep 1
 	return 0
 }
+# Drive
+set_disk_scheduler_() {
+    #List out all the available drives
+    disk=($(lsblk -o NAME,TYPE -n | awk '$2=="disk" {print $1}'))
+    #Count the number of drives
+    diskno=${#disk[@]}
+	#Check if the disk is Set
+	if [[ $diskno -eq 0 ]]; then
+		fail "Disk not found"
+		return 1
+	fi
+    #Changing the scheduler per disk depending on whether they are SSD or HDD
+    for ((i = 0; i < diskno; i++)); do
+	    diskname=${disk[$i]}
+	    disktype=$(cat /sys/block/$diskname/queue/rotational)
+		# SSD
+	    if [ "${disktype}" == 0 ]; then
+		    echo kyber > /sys/block/$diskname/queue/scheduler
+		# HDD
+	    else
+		    echo mq-deadline > /sys/block/$diskname/queue/scheduler
+	    fi
+    done
+	return 0
+}
+
+set_disk_scheduler_udev_() {
+    local rules_file="/etc/udev/rules.d/60-scheduler.rules"
+
+    # Check if running with root privileges
+    if [[ $EUID -ne 0 ]]; then
+        fail "This script must be run as root"
+		return 1
+    fi
+
+    # Check if running in a virtual machine
+    if [ -n "$virt_tech" ]; then
+        info "in virtual machine, skip IO scheduler settings"
+        return 1
+    fi
+
+    # Create or overwrite the udev rules file
+    cat > "$rules_file" <<EOF
+# Set the scheduler for NVMe SSDs to none
+ACTION=="add|change", KERNEL=="nvme*", RUN+="/bin/sh -c 'echo none > /sys/block/%k/queue/scheduler'"
+
+# Set the scheduler for SATA SSDs to kyber
+ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}=="0", RUN+="/bin/sh -c 'echo kyber > /sys/block/%k/queue/scheduler'"
+
+# Set the scheduler for HDDs to mq-deadline
+ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}=="1", RUN+="/bin/sh -c 'echo mq-deadline > /sys/block/%k/queue/scheduler'"
+EOF
+
+    # Check if the rules file was created successfully
+    if [[ ! -f "$rules_file" ]]; then
+        fail "Failed to create udev rules file: $rules_file"
+		return 1
+    fi
+
+    # Reload udev rules
+    udevadm control --reload-rules || fail "Failed to reload udev rules"
+
+    # Trigger udev rules to apply to existing devices
+    udevadm trigger || fail "Failed to trigger udev rules"
+
+    info "I/O scheduler settings applied via udev rules."
+    return 0
+}
+
+
 #TCP Queue Length
 set_txqueuelen_() {
 	if [ -z $(which net-tools) ]; then
@@ -1349,7 +1419,7 @@ install_bbrv3_() {
 sysinfo_
 update_
 clear
-while getopts "abcdstx3h" opt; do
+while getopts "abcdstx3hi" opt; do
 	case ${opt} in
 		a )
 		seperator
@@ -1594,6 +1664,16 @@ while getopts "abcdstx3h" opt; do
 				fail "不支持此系统"
 			fi
 			;;
+		i )
+			seperator
+			info "设置磁盘IO调度器，HDD设置为mq-deadline，SSD设置为kyber"
+			set_disk_scheduler_udev_ &> /dev/null
+			if [ $? -eq 0 ]; then
+				info "磁盘IO调度器设置成功"
+			else
+				fail "磁盘IO调度器设置失败"
+			fi
+			;;
 		h )
 			info "用法： ./tune.sh [选项]"
 			info "选项："
@@ -1603,6 +1683,7 @@ while getopts "abcdstx3h" opt; do
 			info "  -t  调整系统参数"
 			info "  -x  安装BBRx"
 			info "  -3  安装BBRv3"
+			info "  -i  设置磁盘IO调度器"
 			info "  -h  显示此帮助信息"
 			exit 0
 			;;
