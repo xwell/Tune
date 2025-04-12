@@ -1253,6 +1253,23 @@ set_initial_congestion_window_() {
 echo "============== System Network Optimization Script ==============="
 echo "Starting system network optimization..."
 
+# network connection check
+echo "Waiting for network connection..."
+# try up to 60 times, 5 seconds apart
+for i in {1..60}; do
+    if ping -c 1 -W 1 8.8.8.8 &> /dev/null || ping -c 1 -W 1 114.114.114.114 &> /dev/null; then
+        echo "Network connected, continue..."
+        break
+    fi
+    
+    if [ $i -eq 60 ]; then
+        echo "Network connection timeout, continue..."
+    else
+        echo "Waiting for network connection, try $i/60..."
+        sleep 5
+    fi
+done
+
 echo "=============== Getting System Information =================="
 sysinfo_
 
