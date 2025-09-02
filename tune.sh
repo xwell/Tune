@@ -1382,6 +1382,140 @@ EOF
 	return 0
 }
 
+install_bbry_() {
+	#Check if $OS is Set
+	if [[ -z $OS ]]; then
+		# Linux Distro Version check
+		if [ -f /etc/os-release ]; then
+			. /etc/os-release
+			OS=$NAME
+		elif type lsb_release >/dev/null 2>&1; then
+			OS=$(lsb_release -si)
+		elif [ -f /etc/lsb-release ]; then
+			. /etc/lsb-release
+			OS=$DISTRIB_ID
+		elif [ -f /etc/debian_version ]; then
+			OS=Debian
+		else
+			OS=$(uname -s)
+			VER=$(uname -r)
+		fi
+	fi
+	if [[ "$OS" =~ "Debian" ]]; then
+		if [ $(uname -m) == "x86_64" ]; then
+			apt-get -y install linux-image-amd64 linux-headers-amd64
+			if [ $? -ne 0 ]; then
+				fail "BBRy installation failed"
+				return 1
+			fi
+		elif [ $(uname -m) == "aarch64" ]; then
+			apt-get -y install linux-image-arm64 linux-headers-arm64
+			if [ $? -ne 0 ]; then
+				fail "BBRy installation failed"
+				return 1
+			fi
+		fi
+	elif [[ "$OS" =~ "Ubuntu" ]]; then
+		apt-get -y install linux-image-generic linux-headers-generic
+		if [ $? -ne 0 ]; then
+			fail "BBRy installation failed"
+			return 1
+		fi
+	else
+		fail "Unsupported OS"
+		return 1
+	fi
+	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRy.sh && chmod +x BBRy.sh
+	# Check if download fail
+	if [ ! -f BBRy.sh ]; then
+		fail "BBRy download failed"
+		return 1
+	fi
+    ## Install tweaked BBR automatically on reboot
+    cat << EOF > /etc/systemd/system/bbrinstall.service
+[Unit]
+Description=BBRinstall
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/BBRy.sh
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable bbrinstall.service
+	return 0
+}
+
+install_bbrz_() {
+	#Check if $OS is Set
+	if [[ -z $OS ]]; then
+		# Linux Distro Version check
+		if [ -f /etc/os-release ]; then
+			. /etc/os-release
+			OS=$NAME
+		elif type lsb_release >/dev/null 2>&1; then
+			OS=$(lsb_release -si)
+		elif [ -f /etc/lsb-release ]; then
+			. /etc/lsb-release
+			OS=$DISTRIB_ID
+		elif [ -f /etc/debian_version ]; then
+			OS=Debian
+		else
+			OS=$(uname -s)
+			VER=$(uname -r)
+		fi
+	fi
+	if [[ "$OS" =~ "Debian" ]]; then
+		if [ $(uname -m) == "x86_64" ]; then
+			apt-get -y install linux-image-amd64 linux-headers-amd64
+			if [ $? -ne 0 ]; then
+				fail "BBRz installation failed"
+				return 1
+			fi
+		elif [ $(uname -m) == "aarch64" ]; then
+			apt-get -y install linux-image-arm64 linux-headers-arm64
+			if [ $? -ne 0 ]; then
+				fail "BBRz installation failed"
+				return 1
+			fi
+		fi
+	elif [[ "$OS" =~ "Ubuntu" ]]; then
+		apt-get -y install linux-image-generic linux-headers-generic
+		if [ $? -ne 0 ]; then
+			fail "BBRz installation failed"
+			return 1
+		fi
+	else
+		fail "Unsupported OS"
+		return 1
+	fi
+	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRz.sh && chmod +x BBRz.sh
+	# Check if download fail
+	if [ ! -f BBRz.sh ]; then
+		fail "BBRz download failed"
+		return 1
+	fi
+    ## Install tweaked BBR automatically on reboot
+    cat << EOF > /etc/systemd/system/bbrinstall.service
+[Unit]
+Description=BBRinstall
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/BBRz.sh
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl enable bbrinstall.service
+	return 0
+}
+
 install_bbrv3_() {
 	if [ $(uname -m) == "x86_64" ]; then
 		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/x86_64/linux-headers-6.4.0+-amd64.deb -O /root/linux-headers-6.4.0+-amd64.deb
@@ -1436,7 +1570,7 @@ install_bbrv3_() {
 sysinfo_
 update_
 clear
-while getopts "abcdstx3hi" opt; do
+while getopts "abcdstfyzx3hi" opt; do
 	case ${opt} in
 		a )
 		seperator
@@ -1612,6 +1746,23 @@ while getopts "abcdstx3hi" opt; do
 				fail "Fail2ban安装失败"
 			fi
 			;;
+		f )
+			seperator
+			info "安装Fail2ban"
+			BLA::start_loading_animation "${BLA_classic[@]}"
+			fail2ban_ &> /dev/null
+			if [ $? -eq 0 ]; then
+				fail2ban_success=1
+			else
+				fail2ban_success=0
+			fi
+			BLA::stop_loading_animation
+			if [ $fail2ban_success -eq 1 ]; then
+				info "Fail2ban安装成功"
+			else
+				fail "Fail2ban安装失败"
+			fi
+			;;
 		t )
 			seperator
 			info "调整系统参数"
@@ -1650,6 +1801,58 @@ while getopts "abcdstx3hi" opt; do
 					info "重启系统以启用BBRx"
 				else
 					fail "BBRx安装失败"
+				fi
+			else
+				fail "不支持此系统"
+			fi
+			;;
+		y )
+			seperator
+			info "安装BBRy"
+			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
+				fail "不支持LXC"
+				exit 1
+			fi
+			#Only support Debian and Ubuntu
+			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
+				BLA::start_loading_animation "${BLA_classic[@]}"
+				install_bbry_ &> /dev/null
+				if [ $? -eq 0 ]; then
+					bbry_success=1
+				else
+					bbry_success=0
+				fi
+				BLA::stop_loading_animation
+				if [ $bbry_success -eq 1 ]; then
+					info "重启系统以启用BBRy"
+				else
+					fail "BBRy安装失败"
+				fi
+			else
+				fail "不支持此系统"
+			fi
+			;;
+		z )
+			seperator
+			info "安装BBRz"
+			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
+				fail "不支持LXC"
+				exit 1
+			fi
+			#Only support Debian and Ubuntu
+			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
+				BLA::start_loading_animation "${BLA_classic[@]}"
+				install_bbrz_ &> /dev/null
+				if [ $? -eq 0 ]; then
+					bbrz_success=1
+				else
+					bbrz_success=0
+				fi
+				BLA::stop_loading_animation
+				if [ $bbrz_success -eq 1 ]; then
+					info "重启系统以启用BBRz"
+				else
+					fail "BBRz安装失败"
 				fi
 			else
 				fail "不支持此系统"
@@ -1697,8 +1900,11 @@ while getopts "abcdstx3hi" opt; do
 			info "  -b  设置每月带库上限"
 			info "  -d  DDoS 自动关机"
 			info "  -s  SSH登录安全設定"
+			info "  -f  仅安装Fail2ban"
 			info "  -t  调整系统参数"
-			info "  -x  安装BBRx"
+			info "  -x  安装BBRx(备选方案)"
+			info "  -y  安装BBRy(普通服务器推荐)"
+			info "  -z  安装BBRz(刷流推荐)"
 			info "  -3  安装BBRv3"
 			info "  -i  设置磁盘IO调度器"
 			info "  -h  显示此帮助信息"
