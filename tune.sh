@@ -1205,25 +1205,79 @@ set_ring_buffer_() {
 			fi
 		fi
 	fi
-	
-	echo "Setting receive buffer size..."
-    ethtool -G $nic rx 1024
-	if [ $? -ne 0 ]; then
-		fail "Receive buffer setting failed"
-		return 1
-	fi
-    sleep 1
-	
-	echo "Setting transmit buffer size..."
-    ethtool -G $nic tx 2048
-	if [ $? -ne 0 ]; then
-		fail "Transmit buffer setting failed"
-		return 1
-	fi
-    sleep 1
-	
-	echo "Ring buffer setting completed"
-	return 0
+	local interface=$nic;
+    # Query current ring buffer parameters
+    ring_info=$(ethtool -g $interface 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        warn "Unable to query ring buffer info for $interface, skipping"
+        return 0
+    fi
+    
+    # Extract maximum supported RX and TX
+    max_rx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "RX:" | head -1 | awk '{print $2}')
+    max_tx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "TX:" | head -1 | awk '{print $2}')
+    
+    # Extract current RX and TX
+    current_rx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
+    current_tx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
+    
+    info "Interface $interface ring buffer info:"
+    info "  RX: current=$current_rx, max=$max_rx"
+    info "  TX: current=$current_tx, max=$max_tx"
+    
+    # Validate parsed max values
+    if ! [[ "$max_rx" =~ ^[0-9]+$ ]] || ! [[ "$max_tx" =~ ^[0-9]+$ ]]; then
+        warn "Failed to parse max values, falling back to conservative defaults"
+        # Use conservative defaults
+        target_rx=512
+        target_tx=512
+    else
+        # Use hardware maximums for best throughput
+        # Pre-set maximums are vendor-guaranteed safe upper bounds
+        target_rx=$max_rx
+        target_tx=$max_tx
+        info "Using max ring buffer values: RX=$target_rx, TX=$target_tx (maximize throughput)"
+    fi
+    
+    info "Target ring buffer: RX=$target_rx, TX=$target_tx"
+    
+    # Apply RX ring buffer
+    if [ "$current_rx" != "$target_rx" ]; then
+        info "Setting RX ring buffer to $target_rx..."
+        ethtool -G $interface rx $target_rx 2>/dev/null
+        if [ $? -eq 0 ]; then
+            success "RX ring buffer set"
+        else
+            warn "Failed to set RX ring buffer; driver may not allow changes"
+        fi
+        sleep 1
+    else
+        info "RX ring buffer already optimal; skipping"
+    fi
+    
+    # Apply TX ring buffer
+    if [ "$current_tx" != "$target_tx" ]; then
+        info "Setting TX ring buffer to $target_tx..."
+        ethtool -G $interface tx $target_tx 2>/dev/null
+        if [ $? -eq 0 ]; then
+            success "TX ring buffer set"
+        else
+            warn "Failed to set TX ring buffer; driver may not allow changes"
+        fi
+        sleep 1
+    else
+        info "TX ring buffer already optimal; skipping"
+    fi
+    
+    # Verify applied settings
+    final_ring_info=$(ethtool -g $interface 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        final_rx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
+        final_tx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
+        info "Ring buffer configured: RX=$final_rx, TX=$final_tx"
+    fi
+    
+    return 0
 }
 
 ## Disable TSO
