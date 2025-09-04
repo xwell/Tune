@@ -519,9 +519,9 @@ set_file_open_limit_() {
 
     cat << EOF >> /etc/security/limits.conf
 ## Hard limit for max opened files
-* soft nofile 65536
+* soft nofile 655360
 ## Soft limit for max opened files
-* hard nofile 65536
+* hard nofile 655360
 EOF
 	return 0
 }
