@@ -1163,306 +1163,55 @@ tune_() {
 
 ## Configue Boot Script
 boot_script_() {
+	mkdir -p /root/.tune
+	cp -f "${BASH_SOURCE[0]}" /root/.tune/tune.sh 2>/dev/null || cp -f "$0" /root/.tune/tune.sh 2>/dev/null
+	
 	touch /root/.boot-script.sh && chmod +x /root/.boot-script.sh
 	cat << 'EOF' > /root/.boot-script.sh
 #!/bin/bash
-
-## Text colors and styles
-info() {
-	echo -e "\e[92m$1\e[0m"
-}
-info_2() {
-	echo -e "\e[94m$1\e[0m"
-}
-fail() {
-	echo -e "\e[91m$1\e[0m" 1>&2
-}
-
-## System information retrieval function
-sysinfo_() {
-	# Linux Distro Version
-	if [ -f /etc/os-release ]; then
-		. /etc/os-release
-		os=$NAME
-		ver=$VERSION_ID
-	elif type lsb_release >/dev/null 2>&1; then
-		os=$(lsb_release -si)
-		ver=$(lsb_release -sr)
-	elif [ -f /etc/lsb-release ]; then
-		. /etc/lsb-release
-		os=$DISTRIB_ID
-		ver=$DISTRIB_RELEASE
-	elif [ -f /etc/debian_version ]; then
-		os=Debian
-		ver=$(cat /etc/debian_version)
-	elif [ -f /etc/redhat-release ]; then
-		os=Redhat
-	else
-		os=$(uname -s)
-		ver=$(uname -r)
-	fi
-
-	# Virtualization Technology
-	if [ $(systemd-detect-virt) != "none" ]; then
-		virt_tech=$(systemd-detect-virt)
-	fi
-
-	# Memory Size
-	mem_size=$(free -m | grep Mem | awk '{print $2}')
-
-	# Network interface
-	nic=$(ip addr | grep 'state UP' | awk '{print $2}' | sed 's/.$//' | cut -d'@' -f1 | head -1)
-
-	echo "System Information:"
-	echo "Operating System: $os $ver"
-	echo "Virtualization Technology: $virt_tech"
-	echo "Memory Size: $mem_size MB"
-	echo "Network Interface: $nic"
-	
-	return 0
-}
-
-## Set ring buffer for network interface
-set_ring_buffer_() {
-	echo "Installing necessary tools..."
-	if [ -z $(which ethtool) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get -y install ethtool >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Ethtool installation failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install ethtool -y >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Ethtool installation failed"
-				return 1
-			fi
-		fi
-	fi
-	local interface=$nic;
-    # Query current ring buffer parameters
-    ring_info=$(ethtool -g $interface 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        warn "Unable to query ring buffer info for $interface, skipping"
-        return 0
-    fi
-    
-    # Extract maximum supported RX and TX
-    max_rx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "RX:" | head -1 | awk '{print $2}')
-    max_tx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "TX:" | head -1 | awk '{print $2}')
-    
-    # Extract current RX and TX
-    current_rx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
-    current_tx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
-    
-    info "Interface $interface ring buffer info:"
-    info "  RX: current=$current_rx, max=$max_rx"
-    info "  TX: current=$current_tx, max=$max_tx"
-    
-    # Validate parsed max values
-    if ! [[ "$max_rx" =~ ^[0-9]+$ ]] || ! [[ "$max_tx" =~ ^[0-9]+$ ]]; then
-        warn "Failed to parse max values, falling back to conservative defaults"
-        # Use conservative defaults
-        target_rx=512
-        target_tx=512
-    else
-        # Use hardware maximums for best throughput
-        # Pre-set maximums are vendor-guaranteed safe upper bounds
-        target_rx=$max_rx
-        target_tx=$max_tx
-        info "Using max ring buffer values: RX=$target_rx, TX=$target_tx (maximize throughput)"
-    fi
-    
-    info "Target ring buffer: RX=$target_rx, TX=$target_tx"
-    
-    # Apply RX ring buffer
-    if [ "$current_rx" != "$target_rx" ]; then
-        info "Setting RX ring buffer to $target_rx..."
-        ethtool -G $interface rx $target_rx 2>/dev/null
-        if [ $? -eq 0 ]; then
-            success "RX ring buffer set"
-        else
-            warn "Failed to set RX ring buffer; driver may not allow changes"
-        fi
-        sleep 1
-    else
-        info "RX ring buffer already optimal; skipping"
-    fi
-    
-    # Apply TX ring buffer
-    if [ "$current_tx" != "$target_tx" ]; then
-        info "Setting TX ring buffer to $target_tx..."
-        ethtool -G $interface tx $target_tx 2>/dev/null
-        if [ $? -eq 0 ]; then
-            success "TX ring buffer set"
-        else
-            warn "Failed to set TX ring buffer; driver may not allow changes"
-        fi
-        sleep 1
-    else
-        info "TX ring buffer already optimal; skipping"
-    fi
-    
-    # Verify applied settings
-    final_ring_info=$(ethtool -g $interface 2>/dev/null)
-    if [ $? -eq 0 ]; then
-        final_rx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
-        final_tx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
-        info "Ring buffer configured: RX=$final_rx, TX=$final_tx"
-    fi
-    
-    return 0
-}
-
-## Disable TSO
-disable_tso_() {
-	echo "Installing necessary tools..."
-	if [ -z $(which ethtool) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get -y install ethtool >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Ethtool installation failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install ethtool -y >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Ethtool installation failed"
-				return 1
-			fi
-		fi
-	fi
-	
-	echo "Disabling TSO, GSO, GRO..."
-	ethtool -K $nic tso off gso off gro off
-	if [ $? -ne 0 ]; then
-		fail "TSO disabling failed"
-		return 1
-	fi
-	sleep 1
-	
-	echo "TSO disabling completed"
-	return 0
-}
-
-## Set TCP queue length
-set_txqueuelen_() {
-	echo "Installing necessary tools..."
-	if [ -z $(which ifconfig) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install net-tools -y >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Net-tools installation failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install net-tools -y >/dev/null 2>&1
-			if [ $? -ne 0 ]; then
-				fail "Net-tools installation failed"
-				return 1
-			fi
-		fi
-	fi
-	
-	echo "Setting transmit queue length to 10000..."
-    ifconfig $nic txqueuelen 10000
-	if [ $? -ne 0 ]; then
-		fail "Transmit queue length setting failed"
-		return 1
-	fi
-    sleep 1
-	
-	echo "Transmit queue length setting completed"
-	return 0
-}
-
-## Set initial congestion window
-set_initial_congestion_window_() {
-    echo "Setting initial congestion window..."
-    
-    # Wait a bit more to ensure network is stable
-    sleep 5
-    
-    # Get the default route and set initcwnd and initrwnd in one command
-    echo "Command: ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100"
-    ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100
-    
-    # Verify result
-    if [ $? -ne 0 ]; then
-        fail "Setting initial congestion window failed"
-        return 1
-    fi
-    
-    echo "Initial congestion window setting completed"
-    return 0
-}
-
-# Main program starts
-echo "============== System Network Optimization Script ==============="
-echo "Starting system network optimization..."
 
 # network connection check
 echo "Waiting for network connection..."
 # try up to 60 times, 5 seconds apart
 for i in {1..60}; do
-    if ping -c 1 -W 1 8.8.8.8 &> /dev/null || ping -c 1 -W 1 114.114.114.114 &> /dev/null; then
-        echo "Network connected, continue..."
-        break
-    fi
-    
-    if [ $i -eq 60 ]; then
-        echo "Network connection timeout, continue..."
-    else
-        echo "Waiting for network connection, try $i/60..."
-        sleep 5
-    fi
+	if ping -c 1 -W 1 8.8.8.8 &> /dev/null || ping -c 1 -W 1 114.114.114.114 &> /dev/null; then
+		echo "Network connected, continue..."
+		break
+	fi
+	
+	if [ $i -eq 60 ]; then
+		echo "Network connection timeout, continue..."
+	else
+		echo "Waiting for network connection, try $i/60..."
+		sleep 5
+	fi
 done
 
-echo "=============== Getting System Information =================="
+# Source tune functions
+if [ -f /root/.tune/tune.sh ]; then
+	source /root/.tune/tune.sh
+else
+	echo "tune script not found at /root/.tune/tune.sh"
+	exit 1
+fi
+
+# Initialize system info
 sysinfo_
 
-if [ -z "$virt_tech" ]; then    # If not a virtual machine
-    echo "============= Setting Ring Buffer =============="
-    set_ring_buffer_
-    if [ $? -ne 0 ]; then
-        echo "Setting ring buffer failed"
-    else
-        echo "Setting ring buffer succeeded"
-    fi
+# Apply settings based on virtualization
+if [ -z "$virt_tech" ]; then
+	set_ring_buffer_
 else
-    echo "================ Disabling TSO ==================="
-    disable_tso_
-    if [ $? -ne 0 ]; then
-        echo "Disabling TSO failed"
-    else
-        echo "Disabling TSO succeeded"
-    fi
+	disable_tso_
 fi
 
-if [ -z "$virt_tech" ] || [ "$virt_tech" != "lxc" ]; then    # If not an LXC container
-    echo "============= Setting Transmit Queue Length ==============="
-    set_txqueuelen_
-    if [ $? -ne 0 ]; then
-        echo "Setting transmit queue length failed"
-    else
-        echo "Setting transmit queue length succeeded"
-    fi
-    
-    echo "============ Setting Initial Congestion Window ==============="
-    set_initial_congestion_window_
-    if [ $? -ne 0 ]; then
-        echo "Setting initial congestion window failed"
-    else
-        echo "Setting initial congestion window succeeded"
-    fi
+if [ -z "$virt_tech" ] || [ "$virt_tech" != "lxc" ]; then
+	set_txqueuelen_
+	set_initial_congestion_window_
 fi
-
-echo "============== System Network Optimization Completed ==============="
 EOF
 
-# Configure the script to run during system startup
-cat << EOF > /etc/systemd/system/boot-script.service
+	cat << EOF > /etc/systemd/system/boot-script.service
 [Unit]
 Description=System Network Optimization Script
 After=network.target network-online.target
