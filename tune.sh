@@ -519,9 +519,9 @@ set_file_open_limit_() {
 
     cat << EOF >> /etc/security/limits.conf
 ## Hard limit for max opened files
-* soft nofile 655360
+* soft nofile 65536
 ## Soft limit for max opened files
-* hard nofile 655360
+* hard nofile 65536
 EOF
 	return 0
 }
@@ -1108,7 +1108,7 @@ EOF
 }
 tune_() {
 	tuned_
-	# set_file_open_limit_
+	set_file_open_limit_
 	kernel_settings_
 
 	if [ -z "$virt_tech" ]; then		#If not a virtual machine
