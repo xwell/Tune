@@ -231,6 +231,7 @@ SyslogIdentifier=bandwidth_limit
 [Install]
 WantedBy=multi-user.target
 EOF
+	systemctl daemon-reload
 	systemctl enable bandwidth_limit
 	systemctl start bandwidth_limit
 	return 0
@@ -292,6 +293,7 @@ SyslogIdentifier=cpu_abuse_shutdown
 [Install]
 WantedBy=multi-user.target
 EOF
+	systemctl daemon-reload
 	systemctl enable cpu_abuse_shutdown
 	systemctl start cpu_abuse_shutdown
 	return 0
@@ -367,6 +369,7 @@ SyslogIdentifier=ddos_shutdown
 [Install]
 WantedBy=multi-user.target
 EOF
+	systemctl daemon-reload
 	systemctl enable ddos_shutdown
 	systemctl start ddos_shutdown
 
@@ -1440,6 +1443,7 @@ ExecStart=/root/.boot-script.sh
 [Install]
 WantedBy=multi-user.target
 EOF
+	systemctl daemon-reload
 	systemctl enable boot-script.service
 	return 0
 }
@@ -1492,6 +1496,7 @@ RemainAfterExit=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
     systemctl enable bbrinstall.service
 	return 0
 }
@@ -1559,6 +1564,7 @@ RemainAfterExit=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
     systemctl enable bbrinstall.service
 	return 0
 }
@@ -1626,6 +1632,7 @@ RemainAfterExit=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
     systemctl enable bbrinstall.service
 	return 0
 }
