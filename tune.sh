@@ -731,17 +731,25 @@ set_txqueuelen_() {
     sleep 1
 	return 0
 }
-#Initial Congestion Window
 set_initial_congestion_window_() {
     # Get and set the initial congestion window
-    echo "Setting initial congestion window..."
+    info "Setting initial congestion window..."
     
-    # Use a simple command to get and modify the default route in one go
-    ip route change $(ip -o -4 route show to default | head -n1) initcwnd 100 initrwnd 100
+    # Get default route first and verify
+    local default_route
+    default_route=$(ip -o -4 route show to default | head -n1)
+    
+    if [ -z "$default_route" ]; then
+        fail "No default route found"
+        return 1
+    fi
+    
+    # Use the verified route
+    ip route change "$default_route" initcwnd 100 initrwnd 100
     
     # Verify the result
     if [ $? -ne 0 ]; then
-        echo "Failed to set initial congestion window"
+        fail "Failed to set initial congestion window"
         return 1
     fi
     
