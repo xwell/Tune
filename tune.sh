@@ -732,28 +732,52 @@ set_txqueuelen_() {
 	return 0
 }
 set_initial_congestion_window_() {
-    # Get and set the initial congestion window
-    info "Setting initial congestion window..."
-    
-    # Get default route first and verify
-    local default_route
-    default_route=$(ip -o -4 route show to default | head -n1)
-    
-    if [ -z "$default_route" ]; then
-        fail "No default route found"
-        return 1
-    fi
-    
-    # Use the verified route
-    ip route change "$default_route" initcwnd 100 initrwnd 100
-    
-    # Verify the result
-    if [ $? -ne 0 ]; then
-        fail "Failed to set initial congestion window"
-        return 1
-    fi
-    
-    return 0
+	info "Setting initial congestion window for the primary default route..."
+	
+	local primary_route
+	primary_route=$(ip -o -4 route show default scope global | head -n1)
+	[ -z "$primary_route" ] && primary_route=$(ip -o -4 route show to default | head -n1)
+	
+	if [ -z "$primary_route" ]; then
+		fail "No default route found"
+		return 1
+	fi
+	info "Found primary default route: $primary_route"
+	
+	local route_type
+	route_type=$(echo "$primary_route" | awk '{print $2}')
+	
+	if [[ "$route_type" == "via" ]]; then
+		local gateway device
+		gateway=$(echo "$primary_route" | awk '{print $3}')
+		device=$(echo "$primary_route" | awk '{print $5}')
+		if [ -z "$gateway" ] || [ -z "$device" ]; then
+			fail "Could not parse gateway or device from route: '$primary_route'"
+			return 1
+		fi
+		info "Applying change to gateway route via '$gateway' on device '$device'..."
+		ip route change default via "$gateway" dev "$device" initcwnd 100 initrwnd 100
+	elif [[ "$route_type" == "dev" ]]; then
+		local device
+		device=$(echo "$primary_route" | awk '{print $3}')
+		if [ -z "$device" ]; then
+			fail "Could not parse device from route: '$primary_route'"
+			return 1
+		fi
+		info "Applying change to device route on device '$device'..."
+		ip route change default dev "$device" initcwnd 100 initrwnd 100
+	else
+		fail "Unrecognized default route format: '$primary_route'"
+		return 1
+	fi
+	
+	if [ $? -ne 0 ]; then
+		fail "Failed to set initial congestion window."
+		return 1
+	fi
+	
+	info "Successfully set initial congestion window."
+	return 0
 }
 #Kernel Settings
 kernel_settings_() {
