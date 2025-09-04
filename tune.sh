@@ -1681,10 +1681,11 @@ install_bbrv3_() {
 
 
 ## Main
-sysinfo_
-update_
-clear
-while getopts "abcdstfyzx3hi" opt; do
+main() {
+	sysinfo_
+	update_
+	clear
+	while getopts "abcdstfyzx3hi" opt; do
 	case ${opt} in
 		a )
 		seperator
@@ -2030,4 +2031,10 @@ while getopts "abcdstfyzx3hi" opt; do
 			;;
 	esac
 
-done
+	done
+}
+
+# 只在脚本被直接执行时才运行主逻辑
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	main "$@"
+fi
