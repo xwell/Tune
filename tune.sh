@@ -1256,7 +1256,7 @@ install_bbrx_() {
 		fail "Unsupported OS"
 		return 1
 	fi
-	wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRx/BBRx.sh -O /root/BBRx.sh && chmod +x /root/BBRx.sh
+	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRx.sh -O /root/BBRx.sh && chmod +x /root/BBRx.sh
 	# Check if download fail
 	if [ ! -f BBRx.sh ]; then
 		fail "BBR download failed"
