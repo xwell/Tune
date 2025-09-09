@@ -744,40 +744,82 @@ set_initial_congestion_window_() {
 	fi
 	info "Found primary default route: $primary_route"
 	
-	local route_type
-	route_type=$(echo "$primary_route" | awk '{print $2}')
+	# 解析路由信息
+	local gateway device proto src metric
+	gateway=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); break}}')
+	device=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); break}}')
+	proto=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="proto") {print $(i+1); break}}')
+	src=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); break}}')
+	metric=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="metric") {print $(i+1); break}}')
 	
-	if [[ "$route_type" == "via" ]]; then
-		local gateway device
-		gateway=$(echo "$primary_route" | awk '{print $3}')
-		device=$(echo "$primary_route" | awk '{print $5}')
-		if [ -z "$gateway" ] || [ -z "$device" ]; then
-			fail "Could not parse gateway or device from route: '$primary_route'"
+	# 验证必要参数
+	if [ -z "$device" ]; then
+		fail "Could not parse device from route: '$primary_route'"
+		return 1
+	fi
+	
+	# 验证网络接口是否存在
+	if ! ip link show "$device" >/dev/null 2>&1; then
+		fail "Network device '$device' does not exist or is not available"
+		return 1
+	fi
+	
+	# 检查接口状态
+	local interface_state
+	interface_state=$(ip link show "$device" | grep -o "state [A-Z]*" | awk '{print $2}')
+	if [ "$interface_state" != "UP" ]; then
+		warn "Interface '$device' is not UP (current state: $interface_state), attempting to bring it up..."
+		ip link set "$device" up
+		sleep 2
+		interface_state=$(ip link show "$device" | grep -o "state [A-Z]*" | awk '{print $2}')
+		if [ "$interface_state" != "UP" ]; then
+			fail "Failed to bring interface '$device' up (current state: $interface_state)"
 			return 1
 		fi
-		info "Applying change to gateway route via '$gateway' on device '$device'..."
-		ip route change default via "$gateway" dev "$device" initcwnd 100 initrwnd 100
-	elif [[ "$route_type" == "dev" ]]; then
-		local device
-		device=$(echo "$primary_route" | awk '{print $3}')
-		if [ -z "$device" ]; then
-			fail "Could not parse device from route: '$primary_route'"
-			return 1
-		fi
-		info "Applying change to device route on device '$device'..."
-		ip route change default dev "$device" initcwnd 100 initrwnd 100
+	fi
+	
+	# 构建路由修改命令
+	local route_cmd="ip route change default dev $device"
+	
+	# 添加可选参数
+	[ -n "$gateway" ] && route_cmd="$route_cmd via $gateway"
+	[ -n "$proto" ] && route_cmd="$route_cmd proto $proto"
+	[ -n "$src" ] && route_cmd="$route_cmd src $src"
+	[ -n "$metric" ] && route_cmd="$route_cmd metric $metric"
+	
+	# 添加拥塞窗口参数
+	route_cmd="$route_cmd initcwnd 100 initrwnd 100"
+	
+	info "Executing: $route_cmd"
+	
+	# 执行路由修改命令
+	if eval "$route_cmd" 2>/dev/null; then
+		info "Successfully set initial congestion window."
+		return 0
 	else
-		fail "Unrecognized default route format: '$primary_route'"
-		return 1
+		# 如果失败，尝试简化版本
+		warn "Full route modification failed, trying simplified version..."
+		local simple_cmd="ip route change default dev $device initcwnd 100 initrwnd 100"
+		[ -n "$gateway" ] && simple_cmd="ip route change default via $gateway dev $device initcwnd 100 initrwnd 100"
+		
+		info "Trying simplified command: $simple_cmd"
+		if eval "$simple_cmd" 2>/dev/null; then
+			info "Successfully set initial congestion window with simplified command."
+			return 0
+		else
+			# 最后尝试：先删除再添加
+			warn "Simplified command failed, trying delete and add approach..."
+			ip route del default 2>/dev/null
+			sleep 1
+			if eval "$simple_cmd" 2>/dev/null; then
+				info "Successfully set initial congestion window after route recreation."
+				return 0
+			else
+				fail "Failed to set initial congestion window. Last error: $(eval "$simple_cmd" 2>&1)"
+				return 1
+			fi
+		fi
 	fi
-	
-	if [ $? -ne 0 ]; then
-		fail "Failed to set initial congestion window."
-		return 1
-	fi
-	
-	info "Successfully set initial congestion window."
-	return 0
 }
 #Kernel Settings
 kernel_settings_() {
