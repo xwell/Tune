@@ -23,6 +23,8 @@ readonly SYSTEMD_LIMITS_FILE="${SYSTEMD_LIMITS_DIR}/90-tune.conf"
 readonly SSHD_CONFIG="/etc/ssh/sshd_config"
 readonly SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 readonly SSHD_DROPIN="${SSHD_DROPIN_DIR}/99-tune.conf"
+readonly DISK_SCHEDULER_HELPER="${BIN_DIR}/tune-disk-scheduler-apply"
+readonly DISK_SCHEDULER_SERVICE="/etc/systemd/system/tune-disk-scheduler.service"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="${LOG_DIR}/${RUN_ID}.log"
@@ -166,6 +168,8 @@ tr_text() {
         "CPU guard") printf 'CPU 保护' ;;
         "Traffic spike guard") printf '流量突增保护' ;;
         "SSH security") printf 'SSH 安全加固' ;;
+        "Fail2ban") printf 'Fail2ban 防护' ;;
+        "Disk scheduler") printf '磁盘 I/O 调度器' ;;
         "System tuning") printf '系统调优' ;;
         "SUCCESS") printf '成功' ;;
         "FAILED") printf '失败' ;;
@@ -185,12 +189,15 @@ tr_text() {
         "Configuring traffic spike shutdown guard") printf '正在配置流量突增关机保护' ;;
         "Configuring SSH hardening") printf '正在配置 SSH 加固' ;;
         "Installing and configuring fail2ban for SSH") printf '正在为 SSH 安装并配置 fail2ban' ;;
+        "Configuring disk I/O schedulers") printf '正在配置磁盘 I/O 调度器' ;;
+        "Apply disk I/O schedulers now") printf '立即应用磁盘 I/O 调度器' ;;
         "Applying system tuning") printf '正在应用系统调优' ;;
         "Set initial congestion window on default route") printf '设置默认路由的初始拥塞窗口' ;;
         "System tuning completed. Some limits require a reboot or a new login session to fully apply.") printf '系统调优已完成。部分限制需要重启或重新登录后才会完全生效。' ;;
         "No primary network interface detected.") printf '未检测到主网卡。' ;;
         "No primary interface detected. Skipping netdev tuning.") printf '未检测到主网卡，跳过网络设备调优。' ;;
         "Container detected; skipping link queue and route tuning.") printf '检测到容器，跳过链路队列和路由调优。' ;;
+        "Virtual machine or container detected; disk scheduler tuning is skipped.") printf '检测到虚拟机或容器，跳过磁盘调度器调优。' ;;
         "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
         "This action requires systemd. The current environment does not appear to be booted with systemd.") printf '此操作需要 systemd。当前环境似乎不是由 systemd 启动。' ;;
         "This script must be run as root. Try: sudo ./${SCRIPT_NAME} ...") printf '此脚本必须以 root 身份运行。请尝试：sudo ./${SCRIPT_NAME} ...' ;;
@@ -245,6 +252,8 @@ usage() {
   -b, --bandwidth-limit    配置月流量超限关机保护
   -c, --cpu-shutdown       配置持续高 CPU 使用率关机保护
   -d, --ddos-shutdown      配置流量突增关机保护
+  -f, --fail2ban           独立安装/配置 SSH fail2ban 防护
+  -i, --disk-scheduler     配置裸机磁盘 I/O 调度器及开机服务
   -s, --ssh-security       加固 SSH，并安装/配置 fail2ban
   -t, --tune               应用内核/网络调优和开机网络设备辅助服务
 
@@ -280,6 +289,8 @@ Actions:
   -b, --bandwidth-limit    Configure monthly bandwidth shutdown guard
   -c, --cpu-shutdown       Configure sustained high-CPU shutdown guard
   -d, --ddos-shutdown      Configure traffic spike shutdown guard
+  -f, --fail2ban           Install/configure SSH fail2ban protection independently
+  -i, --disk-scheduler     Configure bare-metal disk I/O schedulers and boot service
   -s, --ssh-security       Harden SSH and install/configure fail2ban
   -t, --tune               Apply kernel/network tuning and boot-time netdev helper
 
@@ -1339,6 +1350,120 @@ EOF_F2B
     }
 }
 
+write_disk_scheduler_helper() {
+    write_file "$DISK_SCHEDULER_HELPER" 0755 <<'EOF_DISK_SCHEDULER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-disk-scheduler -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+choose_scheduler() {
+    local available="$1"
+    shift
+    local candidate
+    available="${available//\[/ }"
+    available="${available//\]/ }"
+    for candidate in "$@"; do
+        if grep -qw -- "$candidate" <<< "$available"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    detected_virt="$(systemd-detect-virt 2>/dev/null || true)"
+    if [[ -n "$detected_virt" && "$detected_virt" != "none" ]]; then
+        log_msg notice "Virtualization (${detected_virt}) detected; disk scheduler changes are skipped."
+        exit 0
+    fi
+fi
+
+shopt -s nullglob
+scheduler_files=(/sys/block/*/queue/scheduler)
+if [[ "${#scheduler_files[@]}" -eq 0 ]]; then
+    log_msg notice "No configurable block-device scheduler was found."
+    exit 0
+fi
+
+for scheduler_file in "${scheduler_files[@]}"; do
+    device="${scheduler_file#/sys/block/}"
+    device="${device%%/*}"
+    case "$device" in
+        loop*|ram*|zram*|sr*|fd*|dm-*|md*) continue ;;
+    esac
+
+    if [[ ! -w "$scheduler_file" ]]; then
+        log_msg warning "Scheduler for ${device} is not writable; skipping."
+        continue
+    fi
+
+    available="$(<"$scheduler_file")"
+    selected=""
+    if [[ "$device" == nvme* ]]; then
+        selected="$(choose_scheduler "$available" none kyber mq-deadline deadline noop || true)"
+    elif [[ "$(cat "/sys/block/${device}/queue/rotational" 2>/dev/null || printf '0')" == "1" ]]; then
+        selected="$(choose_scheduler "$available" mq-deadline deadline bfq kyber cfq none noop || true)"
+    else
+        selected="$(choose_scheduler "$available" kyber mq-deadline none deadline bfq noop || true)"
+    fi
+
+    if [[ -z "$selected" ]]; then
+        log_msg warning "No preferred scheduler is supported by ${device}; available: ${available}."
+        continue
+    fi
+
+    if printf '%s\n' "$selected" > "$scheduler_file"; then
+        log_msg info "Set ${device} scheduler to ${selected} (available: ${available})."
+    else
+        log_msg warning "Could not set ${device} scheduler to ${selected}."
+    fi
+done
+EOF_DISK_SCHEDULER
+
+    write_file "$DISK_SCHEDULER_SERVICE" 0644 <<'EOF_DISK_SCHEDULER_UNIT'
+[Unit]
+Description=Tune Disk I/O Schedulers
+After=systemd-udev-trigger.service
+ConditionPathExistsGlob=/sys/block/*/queue/scheduler
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tune-disk-scheduler-apply
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_DISK_SCHEDULER_UNIT
+}
+
+configure_disk_scheduler() {
+    separator
+    info "Configuring disk I/O schedulers"
+
+    if [[ "$VIRT_KIND" != "none" ]]; then
+        warn "Virtual machine or container detected; disk scheduler tuning is skipped."
+        return 0
+    fi
+    require_systemd || return 1
+
+    write_disk_scheduler_helper
+    success "Installed ${DISK_SCHEDULER_HELPER}"
+    enable_start_service tune-disk-scheduler.service || return 1
+}
+
 configure_ssh_security() {
     separator
     info "Configuring SSH hardening"
@@ -1760,6 +1885,8 @@ add_short_action() {
         b) ACTIONS+=("Bandwidth guard:configure_bandwidth_limit") ;;
         c) ACTIONS+=("CPU guard:configure_cpu_shutdown") ;;
         d) ACTIONS+=("Traffic spike guard:configure_ddos_shutdown") ;;
+        f) ACTIONS+=("Fail2ban:configure_fail2ban") ;;
+        i) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
         s) ACTIONS+=("SSH security:configure_ssh_security") ;;
         t) ACTIONS+=("System tuning:apply_system_tuning") ;;
         h) usage; exit 0 ;;
@@ -1779,6 +1906,8 @@ parse_args() {
             -b|--bandwidth-limit) ACTIONS+=("Bandwidth guard:configure_bandwidth_limit") ;;
             -c|--cpu-shutdown) ACTIONS+=("CPU guard:configure_cpu_shutdown") ;;
             -d|--ddos-shutdown) ACTIONS+=("Traffic spike guard:configure_ddos_shutdown") ;;
+            -f|--fail2ban) ACTIONS+=("Fail2ban:configure_fail2ban") ;;
+            -i|--disk-scheduler) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
             -s|--ssh-security) ACTIONS+=("SSH security:configure_ssh_security") ;;
             -t|--tune) ACTIONS+=("System tuning:apply_system_tuning") ;;
             --lang)
@@ -1799,7 +1928,7 @@ parse_args() {
             -h|--help) usage; exit 0 ;;
             --) shift; break ;;
             -*)
-                if [[ "$1" =~ ^-[abcdsth]+$ && "${#1}" -gt 2 ]]; then
+                if [[ "$1" =~ ^-[abcdfisth]+$ && "${#1}" -gt 2 ]]; then
                     local chars="${1#-}"
                     local i
                     for ((i=0; i<${#chars}; i++)); do
