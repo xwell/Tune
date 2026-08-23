@@ -2391,7 +2391,14 @@ apply_system_tuning() {
         success "Installed ${BIN_DIR}/tune-boot-apply"
         reload_systemd || return 1
         run_cmd "Disable direct boot activation of tune-boot-apply.service" systemctl disable --now tune-boot-apply.service || return 1
-        enable_start_service tune-boot-apply.timer || return 1
+        run_cmd "Enable and start tune-boot-apply.timer" systemctl enable --now tune-boot-apply.timer || {
+            service_logs_hint tune-boot-apply.timer
+            return 1
+        }
+        run_cmd "Check tune-boot-apply.timer is active" systemctl is-active --quiet tune-boot-apply.timer || {
+            service_logs_hint tune-boot-apply.timer
+            return 1
+        }
     fi
 
     success "System tuning completed. Some limits require a reboot or a new login session to fully apply."
