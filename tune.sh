@@ -25,6 +25,14 @@ readonly SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 readonly SSHD_DROPIN="${SSHD_DROPIN_DIR}/99-tune.conf"
 readonly DISK_SCHEDULER_HELPER="${BIN_DIR}/tune-disk-scheduler-apply"
 readonly DISK_SCHEDULER_SERVICE="/etc/systemd/system/tune-disk-scheduler.service"
+readonly BBR_SOURCE_COMMIT="802fada1488bfbb9540a5740082d557aa88f8d6b"
+readonly BBR_SOURCE_BASE="https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/${BBR_SOURCE_COMMIT}/BBR/BBRx"
+readonly BBR_DKMS_VERSION="1.0.0.802fada"
+readonly BBR_SYSCTL_FILE="/etc/sysctl.d/90-tune-bbr.conf"
+readonly BBR_MODULES_FILE="/etc/modules-load.d/90-tune-bbr.conf"
+readonly BBRV3_INSTALLER_COMMIT="97470df47a948b0f39082e7679c630eaeff438d1"
+readonly BBRV3_INSTALLER_URL="https://raw.githubusercontent.com/jerry048/Dedicated-Seedbox/${BBRV3_INSTALLER_COMMIT}/lib/components/bbr/BBRInstall.sh"
+readonly BBRV3_INSTALLER_SHA256="9b8c099c90d5707bdeae57b460b525865d55981c2f37c1814257a30a130cbe8f"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_LOG="${LOG_DIR}/${RUN_ID}.log"
@@ -171,6 +179,10 @@ tr_text() {
         "SSH security") printf 'SSH 安全加固' ;;
         "Fail2ban") printf 'Fail2ban 防护' ;;
         "Disk scheduler") printf '磁盘 I/O 调度器' ;;
+        "BBRx") printf 'BBRx' ;;
+        "BBRy") printf 'BBRy' ;;
+        "BBRz") printf 'BBRz' ;;
+        "BBRv3") printf 'BBRv3' ;;
         "System tuning") printf '系统调优' ;;
         "SUCCESS") printf '成功' ;;
         "FAILED") printf '失败' ;;
@@ -199,6 +211,11 @@ tr_text() {
         "No primary interface detected. Skipping netdev tuning.") printf '未检测到主网卡，跳过网络设备调优。' ;;
         "Container detected; skipping link queue and route tuning.") printf '检测到容器，跳过链路队列和路由调优。' ;;
         "Virtual machine or container detected; disk scheduler tuning is skipped.") printf '检测到虚拟机或容器，跳过磁盘调度器调优。' ;;
+        "BBR kernel/DKMS installation is not supported inside a container.") printf '容器中不支持安装 BBR 内核/DKMS 组件。' ;;
+        "BBRx and BBRz support Debian 12 and Debian 13 only.") printf 'BBRx 和 BBRz 仅支持 Debian 12 与 Debian 13。' ;;
+        "The running kernel headers are unavailable after package installation.") printf '安装软件包后仍找不到当前运行内核的头文件。' ;;
+        "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
+        "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run.") printf '每次运行只能选择 BBRx、BBRy、BBRz 或 BBRv3 中的一个。' ;;
         "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
         "This action requires systemd. The current environment does not appear to be booted with systemd.") printf '此操作需要 systemd。当前环境似乎不是由 systemd 启动。' ;;
         "This script must be run as root. Try: sudo ./${SCRIPT_NAME} ...") printf '此脚本必须以 root 身份运行。请尝试：sudo ./${SCRIPT_NAME} ...' ;;
@@ -258,6 +275,10 @@ usage() {
   -i, --disk-scheduler     配置裸机磁盘 I/O 调度器及开机服务
   -s, --ssh-security       加固 SSH，并安装/配置 fail2ban
   -t, --tune               应用内核/网络调优和开机网络设备辅助服务
+  -x, --bbrx               从固定并校验的源码安装 BBRx DKMS 模块
+  -Y, --bbry               从固定并校验的源码安装 BBRy DKMS 模块
+  -z, --bbrz               从固定并校验的源码安装 BBRz DKMS 模块
+  -3, --bbrv3              通过固定并校验的 Dedicated 安装器安装 BBRv3 内核
 
 通用：
   -y, --yes                在安全的 yes/no 确认处默认回答 yes
@@ -295,6 +316,10 @@ Actions:
   -i, --disk-scheduler     Configure bare-metal disk I/O schedulers and boot service
   -s, --ssh-security       Harden SSH and install/configure fail2ban
   -t, --tune               Apply kernel/network tuning and boot-time netdev helper
+  -x, --bbrx               Install BBRx DKMS from pinned, verified source
+  -Y, --bbry               Install BBRy DKMS from pinned, verified source
+  -z, --bbrz               Install BBRz DKMS from pinned, verified source
+  -3, --bbrv3              Install a BBRv3 kernel via the pinned, verified Dedicated installer
 
 General:
   -y, --yes                Assume yes for yes/no confirmations where safe
@@ -1466,6 +1491,255 @@ configure_disk_scheduler() {
     enable_start_service tune-disk-scheduler.service || return 1
 }
 
+verify_file_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        printf 'SHA-256 mismatch for %s: expected %s, got %s\n' "$file" "$expected" "$actual" >&2
+        return 1
+    fi
+}
+
+resolve_bbr_source() {
+    local algo="$1"
+    local source_file sha256
+
+    case "$algo:${OS_ID}:${OS_MAJOR}" in
+        bbrx:debian:12)
+            source_file="tcp_bbrx.c"
+            sha256="a92cd0e85c4803dfdae53722a560b79f3a0f20ae008cf53331b8d1f3424235fe"
+            ;;
+        bbrx:debian:13)
+            source_file="tcp_bbrx_debian13.c"
+            sha256="61d5e01dce308f8e82f5951d53ad59bdbdf2517263344deb3b13f0bbee89cff5"
+            ;;
+        bbrz:debian:12)
+            source_file="tcp_bbrz.c"
+            sha256="32041c154e49bb9f66375a0ec8ed074cb4b8e1c8c70340d2b6130946aff1e7c0"
+            ;;
+        bbrz:debian:13)
+            source_file="tcp_bbrz_debian13.c"
+            sha256="9e475cd34138663fe834b77acf4c98306df6fa2a654dc5a3fe75b526b80a6c51"
+            ;;
+        bbry:debian:*|bbry:ubuntu:*)
+            source_file="tcp_bbry.c"
+            sha256="2aba211ff08fad76d91f992820cb22efbbd9b0786f369d0a3cde410befbd56b3"
+            ;;
+        bbrx:*:*|bbrz:*:*)
+            error "BBRx and BBRz support Debian 12 and Debian 13 only."
+            return 1
+            ;;
+        *)
+            error "Unsupported BBR algorithm: ${algo}."
+            return 1
+            ;;
+    esac
+
+    printf '%s\t%s\t%s\n' "${BBR_SOURCE_BASE}/${source_file}" "$source_file" "$sha256"
+}
+
+remove_existing_dkms_versions() {
+    local algo="$1"
+    local status version
+    local -a versions=()
+
+    status="$(dkms status 2>/dev/null || true)"
+    mapfile -t versions < <(awk -F'[/,]' -v module="$algo" '$1 == module {print $2}' <<< "$status" | sort -u)
+    for version in "${versions[@]}"; do
+        [[ -n "$version" ]] || continue
+        run_cmd "Remove existing DKMS module ${algo}/${version}" dkms remove -m "$algo" -v "$version" --all || return 1
+    done
+}
+
+verify_congestion_control_available() {
+    local algo="$1"
+    local available
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control)"
+    [[ " $available " == *" $algo "* ]]
+}
+
+verify_congestion_control_active() {
+    local algo="$1"
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "$algo" ]]
+}
+
+sync_tune_sysctl_for_bbr() {
+    local algo="$1"
+    local updated
+    [[ -f "$SYSCTL_FILE" ]] || return 0
+
+    updated="$(awk -v cc="$algo" '
+        /^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/ {
+            print "net.core.default_qdisc = fq"
+            qdisc_found=1
+            next
+        }
+        /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {
+            print "net.ipv4.tcp_congestion_control = " cc
+            cc_found=1
+            next
+        }
+        { print }
+        END {
+            if (!qdisc_found) print "net.core.default_qdisc = fq"
+            if (!cc_found) print "net.ipv4.tcp_congestion_control = " cc
+        }
+    ' "$SYSCTL_FILE")"
+    write_file "$SYSCTL_FILE" 0644 <<< "$updated"
+    success "Updated ${SYSCTL_FILE} to preserve ${algo} across sysctl load order."
+}
+
+cleanup_failed_dkms_install() {
+    local algo="$1"
+    dkms remove -m "$algo" -v "$BBR_DKMS_VERSION" --all >/dev/null 2>&1 || true
+}
+
+install_bbr_dkms() {
+    local algo="$1"
+    local source_url source_file source_sha kernel_release module_name dkms_source_dir source_path
+    local module_was_loaded=0
+
+    separator
+    info "Installing ${algo} congestion control from pinned source"
+    if [[ "$VIRT_KIND" == "container" ]]; then
+        error "BBR kernel/DKMS installation is not supported inside a container."
+        return 1
+    fi
+
+    IFS=$'\t' read -r source_url source_file source_sha < <(resolve_bbr_source "$algo") || return 1
+    kernel_release="$(uname -r)"
+    module_name="tcp_${algo}"
+    dkms_source_dir="/usr/src/${algo}-${BBR_DKMS_VERSION}"
+    source_path="${dkms_source_dir}/src/${module_name}.c"
+
+    ensure_packages dkms build-essential "linux-headers-${kernel_release}" curl ca-certificates kmod || return 1
+    if [[ "$DRY_RUN" -eq 0 && ! -f "/lib/modules/${kernel_release}/build/Makefile" ]]; then
+        error "The running kernel headers are unavailable after package installation."
+        return 1
+    fi
+    if [[ "$DRY_RUN" -eq 0 && -d "/sys/module/${module_name}" ]]; then
+        module_was_loaded=1
+    fi
+
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        remove_existing_dkms_versions "$algo" || return 1
+    else
+        info "DRY-RUN: would remove existing ${algo} DKMS versions before replacement."
+    fi
+    run_cmd "Remove previous Tune DKMS source for ${algo}" rm -rf -- "$dkms_source_dir" || return 1
+    run_cmd "Create DKMS source directory for ${algo}" install -d -o root -g root -m 0755 "${dkms_source_dir}/src" || return 1
+    run_cmd "Download pinned ${algo} source" curl -fL --retry 3 --connect-timeout 15 --output "$source_path" "$source_url" || return 1
+    run_cmd "Verify pinned ${algo} source" verify_file_sha256 "$source_path" "$source_sha" || return 1
+
+    write_file "${dkms_source_dir}/Makefile" 0644 <<EOF_BBR_MAKEFILE
+obj-m += ${module_name}.o
+EOF_BBR_MAKEFILE
+    write_file "${dkms_source_dir}/dkms.conf" 0644 <<EOF_BBR_DKMS
+PACKAGE_NAME="${algo}"
+PACKAGE_VERSION="${BBR_DKMS_VERSION}"
+MAKE[0]="make -C \${kernel_source_dir} M=\${dkms_tree}/${algo}/${BBR_DKMS_VERSION}/build/src modules"
+CLEAN="make -C \${kernel_source_dir} M=\${dkms_tree}/${algo}/${BBR_DKMS_VERSION}/build/src clean"
+BUILT_MODULE_NAME[0]="${module_name}"
+BUILT_MODULE_LOCATION[0]="src/"
+DEST_MODULE_LOCATION[0]="/updates/net/ipv4"
+AUTOINSTALL="yes"
+EOF_BBR_DKMS
+
+    if ! run_cmd "Add ${algo} to DKMS" dkms add -m "$algo" -v "$BBR_DKMS_VERSION"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+    if ! run_cmd "Build ${algo} DKMS module" dkms build -m "$algo" -v "$BBR_DKMS_VERSION" -k "$kernel_release"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+    if ! run_cmd "Install ${algo} DKMS module" dkms install -m "$algo" -v "$BBR_DKMS_VERSION" -k "$kernel_release"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+
+    run_cmd "Refresh kernel module dependencies" depmod -a "$kernel_release" || return 1
+    run_cmd "Load ${module_name}" modprobe "$module_name" || return 1
+    run_cmd "Verify ${algo} is available" verify_congestion_control_available "$algo" || return 1
+
+    write_file "$BBR_MODULES_FILE" 0644 <<EOF_BBR_MODULES
+# Managed by tune.sh. Load the selected congestion-control module before sysctl settings.
+${module_name}
+EOF_BBR_MODULES
+    write_file "$BBR_SYSCTL_FILE" 0644 <<EOF_BBR_SYSCTL
+# Managed by tune.sh. Source: ${source_file} at commit ${BBR_SOURCE_COMMIT}.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${algo}
+EOF_BBR_SYSCTL
+    sync_tune_sysctl_for_bbr "$algo" || return 1
+    run_cmd "Apply ${algo} congestion control" sysctl -e -p "$BBR_SYSCTL_FILE" || return 1
+    run_cmd "Verify ${algo} is active" verify_congestion_control_active "$algo" || return 1
+
+    if [[ "$module_was_loaded" -eq 1 ]]; then
+        warn "The module was already loaded; reboot to ensure the rebuilt module binary is active."
+    fi
+    success "Installed and activated ${algo}; no reboot was scheduled."
+}
+
+install_bbrx() {
+    install_bbr_dkms bbrx
+}
+
+install_bbry() {
+    install_bbr_dkms bbry
+}
+
+install_bbrz() {
+    install_bbr_dkms bbrz
+}
+
+install_bbrv3() {
+    local installer lang_code="en" rc=0
+    local -a installer_cmd=()
+
+    separator
+    info "Installing BBRv3 with the pinned Dedicated installer"
+    if [[ "$VIRT_KIND" == "container" ]]; then
+        error "BBR kernel/DKMS installation is not supported inside a container."
+        return 1
+    fi
+
+    ensure_packages curl ca-certificates || return 1
+    installer="$(mktemp)"
+    [[ "$LANGUAGE" == "zh-CN" ]] && lang_code="zh-TW"
+
+    if ! run_cmd "Download pinned BBRv3 installer" curl -fL --retry 3 --connect-timeout 15 --output "$installer" "$BBRV3_INSTALLER_URL"; then
+        rm -f -- "$installer"
+        return 1
+    fi
+    if ! run_cmd "Verify pinned BBRv3 installer" verify_file_sha256 "$installer" "$BBRV3_INSTALLER_SHA256"; then
+        rm -f -- "$installer"
+        return 1
+    fi
+
+    installer_cmd=(env "BBR_ALGO=bbrv3" "BBR_LANG=${lang_code}")
+    if [[ -n "${TUNE_BBRV3_RAW_BASE:-}" ]]; then
+        installer_cmd+=("RAW_BASE=${TUNE_BBRV3_RAW_BASE}")
+    fi
+    installer_cmd+=(bash "$installer" --algo bbrv3)
+    run_cmd "Run pinned BBRv3 installer" "${installer_cmd[@]}" || rc=$?
+    rm -f -- "$installer"
+    if [[ "$rc" -ne 0 ]]; then
+        return "$rc"
+    fi
+
+    run_cmd "Remove custom BBR module autoload for BBRv3" rm -f -- "$BBR_MODULES_FILE" || return 1
+    write_file "$BBR_SYSCTL_FILE" 0644 <<EOF_BBRV3_SYSCTL
+# Managed by tune.sh. BBRv3 installer commit: ${BBRV3_INSTALLER_COMMIT}.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF_BBRV3_SYSCTL
+    sync_tune_sysctl_for_bbr bbr || return 1
+    success "BBRv3 installer completed; reboot was not scheduled."
+}
+
 configure_ssh_security() {
     separator
     info "Configuring SSH hardening"
@@ -1640,11 +1914,38 @@ write_sysctl_tuning() {
     install_linux_sysctl_defaults_if_needed
     compute_memory_tuning
 
+    local custom_module="" preferred_cc="" available_cc=""
+    if [[ -r "$BBR_MODULES_FILE" ]]; then
+        custom_module="$(awk '!/^[[:space:]]*(#|$)/ {print $1; exit}' "$BBR_MODULES_FILE")"
+        case "$custom_module" in
+            tcp_bbrx|tcp_bbry|tcp_bbrz) modprobe "$custom_module" 2>/dev/null || true ;;
+            *) custom_module="" ;;
+        esac
+    fi
     modprobe tcp_bbr 2>/dev/null || true
     modprobe sch_fq 2>/dev/null || true
 
     local congestion_control default_qdisc
-    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    if [[ -r "$BBR_SYSCTL_FILE" ]]; then
+        preferred_cc="$(awk -F= '
+            /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {
+                value=$2
+                gsub(/[[:space:]]/, "", value)
+                print value
+                exit
+            }
+        ' "$BBR_SYSCTL_FILE")"
+        case "$preferred_cc" in
+            bbrx|bbry|bbrz) ;;
+            *) preferred_cc="" ;;
+        esac
+    fi
+
+    if [[ -n "$preferred_cc" && " $available_cc " == *" $preferred_cc "* ]]; then
+        congestion_control="$preferred_cc"
+        default_qdisc="fq"
+    elif [[ " $available_cc " == *" bbr "* ]]; then
         congestion_control="bbr"
         default_qdisc="fq"
     else
@@ -2069,6 +2370,10 @@ add_short_action() {
         i) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
         s) ACTIONS+=("SSH security:configure_ssh_security") ;;
         t) ACTIONS+=("System tuning:apply_system_tuning") ;;
+        x) ACTIONS+=("BBRx:install_bbrx") ;;
+        Y) ACTIONS+=("BBRy:install_bbry") ;;
+        z) ACTIONS+=("BBRz:install_bbrz") ;;
+        3) ACTIONS+=("BBRv3:install_bbrv3") ;;
         h) usage; exit 0 ;;
         *) error "Invalid option: -$1"; usage; exit 1 ;;
     esac
@@ -2090,6 +2395,10 @@ parse_args() {
             -i|--disk-scheduler) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
             -s|--ssh-security) ACTIONS+=("SSH security:configure_ssh_security") ;;
             -t|--tune) ACTIONS+=("System tuning:apply_system_tuning") ;;
+            -x|--bbrx) ACTIONS+=("BBRx:install_bbrx") ;;
+            -Y|--bbry) ACTIONS+=("BBRy:install_bbry") ;;
+            -z|--bbrz) ACTIONS+=("BBRz:install_bbrz") ;;
+            -3|--bbrv3) ACTIONS+=("BBRv3:install_bbrv3") ;;
             --lang)
                 shift
                 if [[ "$#" -eq 0 ]]; then
@@ -2108,7 +2417,7 @@ parse_args() {
             -h|--help) usage; exit 0 ;;
             --) shift; break ;;
             -*)
-                if [[ "$1" =~ ^-[abcdfisth]+$ && "${#1}" -gt 2 ]]; then
+                if [[ "$1" =~ ^-[abcdfisthxYz3]+$ && "${#1}" -gt 2 ]]; then
                     local chars="${1#-}"
                     local i
                     for ((i=0; i<${#chars}; i++)); do
@@ -2130,6 +2439,18 @@ parse_args() {
     done
 
     if [[ "${#ACTIONS[@]}" -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    local bbr_action_count=0 entry
+    for entry in "${ACTIONS[@]}"; do
+        case "${entry%%:*}" in
+            BBRx|BBRy|BBRz|BBRv3) ((bbr_action_count += 1)) ;;
+        esac
+    done
+    if (( bbr_action_count > 1 )); then
+        error "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run."
         usage
         exit 1
     fi
