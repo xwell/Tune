@@ -214,7 +214,7 @@ tr_text() {
         "BBR kernel/DKMS installation is not supported inside a container.") printf '容器中不支持安装 BBR 内核/DKMS 组件。' ;;
         "BBRx and BBRz support Debian 12 and Debian 13 only.") printf 'BBRx 和 BBRz 仅支持 Debian 12 与 Debian 13。' ;;
         "The running kernel headers are unavailable after package installation.") printf '安装软件包后仍找不到当前运行内核的头文件。' ;;
-        "The DKMS source is incompatible with the running kernel API. Review the compiler output in the step log.") printf 'DKMS 源码与当前内核 API 不兼容。请查看步骤日志中的编译器输出。' ;;
+        "The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause.") printf 'DKMS 模块构建失败。请查看步骤日志中的编译器输出；源码与内核 API 不匹配是可能原因之一。' ;;
         "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
         "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run.") printf '每次运行只能选择 BBRx、BBRy、BBRz 或 BBRv3 中的一个。' ;;
         "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
@@ -491,7 +491,7 @@ diagnose_failure() {
         elif grep -Eqi 'Permission denied|Operation not permitted' "$logfile"; then
             cause="The command lacked permission, or the host/container blocks that operation."
         elif grep -Eqi 'Bad return status for module build|DKMS.*build failed|fatal error:|error:' "$logfile"; then
-            cause="The DKMS source is incompatible with the running kernel API. Review the compiler output in the step log."
+            cause="The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause."
         elif grep -Eqi 'No such file or directory|command not found|not found' "$logfile"; then
             cause="A required command, file, or path was missing."
         elif grep -Eqi 'Cannot find device|No such device|Device not found' "$logfile"; then
@@ -1657,7 +1657,7 @@ install_bbr_dkms() {
     run_cmd "Download pinned ${algo} source" curl -fL --retry 3 --connect-timeout 15 --output "$source_path" "$source_url" || return 1
     run_cmd "Verify pinned ${algo} source" verify_file_sha256 "$source_path" "$source_sha" || return 1
 
-    write_file "${dkms_source_dir}/Makefile" 0644 <<EOF_BBR_MAKEFILE
+    write_file "${dkms_source_dir}/src/Makefile" 0644 <<EOF_BBR_MAKEFILE
 obj-m += ${module_name}.o
 EOF_BBR_MAKEFILE
     write_file "${dkms_source_dir}/dkms.conf" 0644 <<EOF_BBR_DKMS
