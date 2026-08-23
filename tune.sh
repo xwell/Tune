@@ -214,6 +214,7 @@ tr_text() {
         "BBR kernel/DKMS installation is not supported inside a container.") printf '容器中不支持安装 BBR 内核/DKMS 组件。' ;;
         "BBRx and BBRz support Debian 12 and Debian 13 only.") printf 'BBRx 和 BBRz 仅支持 Debian 12 与 Debian 13。' ;;
         "The running kernel headers are unavailable after package installation.") printf '安装软件包后仍找不到当前运行内核的头文件。' ;;
+        "The DKMS source is incompatible with the running kernel API. Review the compiler output in the step log.") printf 'DKMS 源码与当前内核 API 不兼容。请查看步骤日志中的编译器输出。' ;;
         "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
         "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run.") printf '每次运行只能选择 BBRx、BBRy、BBRz 或 BBRv3 中的一个。' ;;
         "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
@@ -489,6 +490,8 @@ diagnose_failure() {
             cause="APT repository signature/key verification failed."
         elif grep -Eqi 'Permission denied|Operation not permitted' "$logfile"; then
             cause="The command lacked permission, or the host/container blocks that operation."
+        elif grep -Eqi 'Bad return status for module build|DKMS.*build failed|fatal error:|error:' "$logfile"; then
+            cause="The DKMS source is incompatible with the running kernel API. Review the compiler output in the step log."
         elif grep -Eqi 'No such file or directory|command not found|not found' "$logfile"; then
             cause="A required command, file, or path was missing."
         elif grep -Eqi 'Cannot find device|No such device|Device not found' "$logfile"; then
@@ -1598,6 +1601,25 @@ cleanup_failed_dkms_install() {
     dkms remove -m "$algo" -v "$BBR_DKMS_VERSION" --all >/dev/null 2>&1 || true
 }
 
+build_dkms_with_log() {
+    local algo="$1"
+    local version="$2"
+    local kernel_release="$3"
+    local make_log="/var/lib/dkms/${algo}/${version}/build/make.log"
+    local rc=0
+
+    dkms build -m "$algo" -v "$version" -k "$kernel_release" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ -r "$make_log" ]]; then
+            printf '\n### DKMS compiler log: %s\n' "$make_log"
+            cat "$make_log"
+        else
+            printf '\nDKMS compiler log was not readable at %s\n' "$make_log"
+        fi
+    fi
+    return "$rc"
+}
+
 install_bbr_dkms() {
     local algo="$1"
     local source_url source_file source_sha kernel_release module_name dkms_source_dir source_path
@@ -1653,7 +1675,7 @@ EOF_BBR_DKMS
         [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
         return 1
     fi
-    if ! run_cmd "Build ${algo} DKMS module" dkms build -m "$algo" -v "$BBR_DKMS_VERSION" -k "$kernel_release"; then
+    if ! run_cmd "Build ${algo} DKMS module" build_dkms_with_log "$algo" "$BBR_DKMS_VERSION" "$kernel_release"; then
         [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
         return 1
     fi
