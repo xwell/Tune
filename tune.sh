@@ -34,7 +34,7 @@ readonly BBRV3_INSTALLER_COMMIT="97470df47a948b0f39082e7679c630eaeff438d1"
 readonly BBRV3_INSTALLER_URL="https://raw.githubusercontent.com/jerry048/Dedicated-Seedbox/${BBRV3_INSTALLER_COMMIT}/lib/components/bbr/BBRInstall.sh"
 readonly BBRV3_INSTALLER_SHA256="9b8c099c90d5707bdeae57b460b525865d55981c2f37c1814257a30a130cbe8f"
 
-RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_LOG="${LOG_DIR}/${RUN_ID}.log"
 ASSUME_YES=0
 DRY_RUN=0
@@ -1353,7 +1353,9 @@ configure_fail2ban() {
     local ports port_csv
     ports="$(get_sshd_ports 2>/dev/null | paste -sd, -)"
     port_csv="${ports:-ssh}"
-    mkdir -p /etc/fail2ban/jail.d
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p /etc/fail2ban/jail.d
+    fi
 
     write_file /etc/fail2ban/jail.d/sshd-tune.local 0644 <<EOF_F2B
 [sshd]
@@ -1918,15 +1920,29 @@ write_sysctl_tuning() {
     if [[ -r "$BBR_MODULES_FILE" ]]; then
         custom_module="$(awk '!/^[[:space:]]*(#|$)/ {print $1; exit}' "$BBR_MODULES_FILE")"
         case "$custom_module" in
-            tcp_bbrx|tcp_bbry|tcp_bbrz) modprobe "$custom_module" 2>/dev/null || true ;;
+            tcp_bbrx|tcp_bbry|tcp_bbrz)
+                if [[ "$DRY_RUN" -eq 0 ]]; then
+                    modprobe "$custom_module" 2>/dev/null || true
+                fi
+                ;;
             *) custom_module="" ;;
         esac
     fi
-    modprobe tcp_bbr 2>/dev/null || true
-    modprobe sch_fq 2>/dev/null || true
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe sch_fq 2>/dev/null || true
+    fi
 
     local congestion_control default_qdisc
     available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    if [[ "$DRY_RUN" -eq 1 ]] && command_exists modinfo; then
+        if [[ -n "$custom_module" ]] && modinfo "$custom_module" >/dev/null 2>&1; then
+            available_cc+=" ${custom_module#tcp_}"
+        fi
+        if modinfo tcp_bbr >/dev/null 2>&1; then
+            available_cc+=" bbr"
+        fi
+    fi
     if [[ -r "$BBR_SYSCTL_FILE" ]]; then
         preferred_cc="$(awk -F= '
             /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {
@@ -2030,7 +2046,9 @@ root hard nofile 1048576
 EOF_LIMITS
     success "Wrote ${LIMITS_FILE}"
 
-    mkdir -p "$SYSTEMD_LIMITS_DIR"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$SYSTEMD_LIMITS_DIR"
+    fi
     write_file "$SYSTEMD_LIMITS_FILE" 0644 <<'EOF_SYSTEMD_LIMITS'
 # Managed by tune.sh.
 [Manager]
@@ -2499,9 +2517,12 @@ main() {
     preparse_language "$@" || exit 1
     parse_args "$@"
     require_root
-    mkdir -p "$LOG_DIR" "$CONFIG_DIR" "$BIN_DIR"
+    mkdir -p "$LOG_DIR"
     chmod 0700 "$LOG_DIR"
-    chmod 0755 "$CONFIG_DIR" "$BIN_DIR"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$CONFIG_DIR" "$BIN_DIR"
+        chmod 0755 "$CONFIG_DIR" "$BIN_DIR"
+    fi
     touch "$RUN_LOG"
     chmod 0600 "$RUN_LOG"
 
