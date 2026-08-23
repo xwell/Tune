@@ -137,6 +137,7 @@ tr_text() {
     if [[ "$text" =~ ^Wrote\ (.*)$ ]]; then printf '已写入 %s' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Installed\ (.*)$ ]]; then printf '已安装 %s' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Enable\ and\ start\ (.*)$ ]]; then printf '启用并启动 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Disable\ direct\ boot\ activation\ of\ (.*)$ ]]; then printf '停用 %s 的直接开机启动' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Check\ (.*)\ is\ active$ ]]; then printf '检查 %s 是否正在运行' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^To\ diagnose\ (.*):\ (.*)$ ]]; then printf '诊断 %s：%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
     if [[ "$text" =~ ^Likely\ cause:\ (.*)$ ]]; then printf '可能原因：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
@@ -275,7 +276,7 @@ usage() {
   -f, --fail2ban           独立安装/配置 SSH fail2ban 防护
   -i, --disk-scheduler     配置裸机磁盘 I/O 调度器及开机服务
   -s, --ssh-security       加固 SSH，并安装/配置 fail2ban
-  -t, --tune               应用内核/网络调优和开机网络设备辅助服务
+  -t, --tune               应用内核/网络调优和周期性网络设备辅助服务
   -x, --bbrx               从固定并校验的源码安装 BBRx DKMS 模块
   -Y, --bbry               从固定并校验的源码安装 BBRy DKMS 模块
   -z, --bbrz               从固定并校验的源码安装 BBRz DKMS 模块
@@ -316,7 +317,7 @@ Actions:
   -f, --fail2ban           Install/configure SSH fail2ban protection independently
   -i, --disk-scheduler     Configure bare-metal disk I/O schedulers and boot service
   -s, --ssh-security       Harden SSH and install/configure fail2ban
-  -t, --tune               Apply kernel/network tuning and boot-time netdev helper
+  -t, --tune               Apply kernel/network tuning and periodic netdev helper
   -x, --bbrx               Install BBRx DKMS from pinned, verified source
   -Y, --bbry               Install BBRy DKMS from pinned, verified source
   -z, --bbrz               Install BBRz DKMS from pinned, verified source
@@ -2311,14 +2312,13 @@ EOF_NETDEV
 
     write_file /etc/systemd/system/tune-boot-apply.service 0644 <<'EOF_NETDEV_UNIT'
 [Unit]
-Description=Tune Boot-time Network Device Tuning
+Description=Tune Network Device Tuning
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/tune-boot-apply
-RemainAfterExit=yes
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true
@@ -2329,6 +2329,20 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 EOF_NETDEV_UNIT
+
+    write_file /etc/systemd/system/tune-boot-apply.timer 0644 <<'EOF_NETDEV_TIMER'
+[Unit]
+Description=Periodically Reapply Tune Network Device Settings
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=tune-boot-apply.service
+
+[Install]
+WantedBy=timers.target
+EOF_NETDEV_TIMER
 }
 
 apply_netdev_tuning_now() {
@@ -2375,7 +2389,9 @@ apply_system_tuning() {
     if systemd_available; then
         write_netdev_boot_helper
         success "Installed ${BIN_DIR}/tune-boot-apply"
-        enable_start_service tune-boot-apply.service || return 1
+        reload_systemd || return 1
+        run_cmd "Disable direct boot activation of tune-boot-apply.service" systemctl disable --now tune-boot-apply.service || return 1
+        enable_start_service tune-boot-apply.timer || return 1
     fi
 
     success "System tuning completed. Some limits require a reboot or a new login session to fully apply."

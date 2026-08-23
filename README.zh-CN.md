@@ -53,7 +53,7 @@ sudo ./tune.sh --en --help
 | `-f` | `--fail2ban` | 不修改 SSH 设置，独立安装并配置 SSH `fail2ban` 防护。 |
 | `-i` | `--disk-scheduler` | 在裸机上按设备支持情况选择磁盘 I/O 调度器，并安装开机服务。 |
 | `-s` | `--ssh-security` | 加固 SSH、更改 SSH 端口、可选禁用密码登录，并配置 `fail2ban`。 |
-| `-t` | `--tune` | 应用内核/网络调优，并安装开机网络辅助服务。 |
+| `-t` | `--tune` | 应用内核/网络调优，并安装周期性网络辅助服务。 |
 | `-x` | `--bbrx` | 从固定并校验的源码通过 DKMS 构建安装 BBRx。 |
 | `-Y` | `--bbry` | 从固定并校验的源码通过 DKMS 构建安装 BBRy。 |
 | `-z` | `--bbrz` | 从固定并校验的源码通过 DKMS 构建安装 BBRz。 |
@@ -82,7 +82,7 @@ sudo ./tune.sh -ts
 ## 网络和磁盘调优行为
 
 - 裸机 ring buffer 按链路速率选择目标值：1 Gbit/s 及以下为 1024，10 Gbit/s 及以下为 4096，更高速率为 8192。最终值不会超过 `ethtool -g` 报告的硬件上限；无法可靠解析时直接跳过，不猜测回退值。
-- 主 IPv4 默认路由使用参数数组设置 `initcwnd 100` 和 `initrwnd 100`。不使用 `eval`、不删除默认路由，并在立即执行和开机执行后验证结果。
+- 主 IPv4 默认路由使用参数数组设置 `initcwnd 100` 和 `initrwnd 100`。不使用 `eval`、不删除默认路由，并立即验证结果。定时器会在开机一分钟后及此后每五分钟重应用网络设置，因此网络管理器重建路由后也能自动修正。
 - 磁盘调度会检查每个设备的实际支持列表：NVMe 优先 `none`，SATA SSD 优先 `kyber`，HDD 优先 `mq-deadline`，再从可用算法中回退。loop、RAM、光驱、device-mapper 和 MD 设备会被跳过。
 - 虚拟机和容器中会跳过磁盘调度。该操作使用 `tune-disk-scheduler.service`，不写宽泛的 udev 规则。
 
@@ -157,6 +157,7 @@ sudo ./tune.sh --verbose -t
 journalctl -u fail2ban.service --no-pager -n 120
 journalctl -u ssh.service --no-pager -n 120
 journalctl -u tune-boot-apply.service --no-pager -n 120
+systemctl list-timers tune-boot-apply.timer --no-pager
 journalctl -u tune-disk-scheduler.service --no-pager -n 120
 dkms status
 sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
@@ -182,6 +183,7 @@ sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
 /usr/local/sbin/tune-disk-scheduler-apply
 /etc/systemd/system/tune-disk-scheduler.service
 /etc/systemd/system/tune-*.service
+/etc/systemd/system/tune-*.timer
 /usr/src/{bbrx,bbry,bbrz}-1.0.0.802fada/
 ```
 

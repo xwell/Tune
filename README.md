@@ -28,7 +28,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh) --dr
 | `-f` | `--fail2ban` | Installs and configures SSH `fail2ban` protection without changing SSH settings. |
 | `-i` | `--disk-scheduler` | Selects supported disk I/O schedulers on bare metal and installs a boot-time service. |
 | `-s` | `--ssh-security` | Hardens SSH, changes the SSH port, optionally disables password login, and configures `fail2ban`. |
-| `-t` | `--tune` | Applies kernel/network tuning and installs a boot-time network helper. |
+| `-t` | `--tune` | Applies kernel/network tuning and installs a periodic network helper. |
 | `-x` | `--bbrx` | Builds and installs BBRx through DKMS from pinned, verified source. |
 | `-Y` | `--bbry` | Builds and installs BBRy through DKMS from pinned, verified source. |
 | `-z` | `--bbrz` | Builds and installs BBRz through DKMS from pinned, verified source. |
@@ -56,7 +56,7 @@ sudo ./tune.sh -ts
 ## Network and disk tuning behavior
 
 - On bare metal, ring buffers use a speed-based target: 1 Gbit/s and below uses 1024, up to 10 Gbit/s uses 4096, and faster links use 8192. Each value is capped at the maximum reported by `ethtool -g`; unreadable values are skipped instead of guessed.
-- The primary IPv4 default route is updated with `initcwnd 100` and `initrwnd 100` using an argument array. The route is never deleted, `eval` is not used, and the result is verified immediately and at boot.
+- The primary IPv4 default route is updated with `initcwnd 100` and `initrwnd 100` using an argument array. The route is never deleted, `eval` is not used, and the result is verified immediately. A timer reapplies the network settings one minute after boot and every five minutes thereafter, so routes recreated by the network manager are corrected.
 - Disk scheduler tuning checks each device's supported scheduler list. NVMe prefers `none`, SATA SSD prefers `kyber`, and HDD prefers `mq-deadline`, with supported fallbacks. Loop, RAM, optical, device-mapper, and MD devices are skipped.
 - Disk scheduler changes are skipped in VMs and containers. The action installs `tune-disk-scheduler.service` instead of broad udev rules.
 
@@ -131,6 +131,7 @@ Useful diagnostics:
 journalctl -u fail2ban.service --no-pager -n 120
 journalctl -u ssh.service --no-pager -n 120
 journalctl -u tune-boot-apply.service --no-pager -n 120
+systemctl list-timers tune-boot-apply.timer --no-pager
 journalctl -u tune-disk-scheduler.service --no-pager -n 120
 dkms status
 sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
@@ -156,6 +157,7 @@ Depending on selected actions, the script may create or update:
 /usr/local/sbin/tune-disk-scheduler-apply
 /etc/systemd/system/tune-disk-scheduler.service
 /etc/systemd/system/tune-*.service
+/etc/systemd/system/tune-*.timer
 /usr/src/{bbrx,bbry,bbrz}-1.0.0.802fada/
 ```
 
