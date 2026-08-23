@@ -1,89 +1,193 @@
+# tune.sh
 
-# Tune.sh
-## 功能概述
+## Requirements
 
-- **自动更新**: 自动安装系统和软件的更新。
-- **带宽限制**: 设置网络接口的月带宽使用上限。
-- **CPU滥用自动关机**: 当CPU使用率超过设定阈值时自动关闭服务器。
-- **DDoS自动关机**: 当检测到DDoS攻击时自动关闭服务器。
-- **SSH安全设置**: 提高SSH登录的安全性。
-- **系统调优**: 调整系统设置以优化性能。
-- **BBRx和BBRv3安装**：安装BBRx或BBRv3来优化网络性能。
+- Debian or Ubuntu.
+- Run as `root`, usually with `sudo`.
+- `systemd` is required for actions that install or manage services.
+- `apt` repositories must be reachable for package installation.
+- For SSH hardening, keep an existing working SSH session open while testing the new port.
+- DKMS BBR actions need build tools and headers matching the running kernel; containers are rejected.
 
-## 使用方法
-
-使用此脚本前，请确保您具有root权限。脚本的使用方式如下：
+## Quick start
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/jerry048/Tune/main/tune.sh) [选项]
+bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh) --help
+bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh) --dry-run --verbose -t
 ```
 
-### 选项说明
+## Actions
 
-- `-a`: 启动自动更新。
-- `-b`: 设置带宽限制。
-- `-c`: 设置CPU滥用自动关机。
-- `-d`: 启动DDoS自动关机。
-- `-s`: 进行SSH安全设置。
-- `-t`: 执行系统调优。
-- `-x`: 安装BBRx。
-- `-3`: 安装BBRv3。
-- `-h`: 显示帮助信息。
+| Option | Long option | What it does |
+|---|---|---|
+| `-a` | `--auto-updates` | Installs and configures unattended security updates. |
+| `-b` | `--bandwidth-limit` | Configures a monthly bandwidth shutdown guard using `vnStat`. |
+| `-c` | `--cpu-shutdown` | Configures a sustained high-CPU shutdown guard. |
+| `-d` | `--ddos-shutdown` | Configures a traffic spike shutdown guard using `vnStat` and `jq`. |
+| `-f` | `--fail2ban` | Installs and configures SSH `fail2ban` protection without changing SSH settings. |
+| `-i` | `--disk-scheduler` | Selects supported disk I/O schedulers on bare metal and installs a boot-time service. |
+| `-s` | `--ssh-security` | Hardens SSH, changes the SSH port, optionally disables password login, and configures `fail2ban`. |
+| `-t` | `--tune` | Applies kernel/network tuning and installs a periodic network helper. |
+| `-x` | `--bbrx` | Builds and installs BBRx through DKMS from pinned, verified source. |
+| `-Y` | `--bbry` | Builds and installs BBRy through DKMS from pinned, verified source; unavailable on Debian 13. |
+| `-z` | `--bbrz` | Builds and installs BBRz through DKMS from pinned, verified source. |
+| `-3` | `--bbrv3` | Installs a BBRv3 kernel through the pinned, verified Dedicated installer. |
 
-### 示例
-
-启动自动更新和设置带宽限制：
+Short options can be combined, for example:
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/jerry048/Tune/main/tune.sh) -a -b
+sudo ./tune.sh -ts
 ```
-## 功能介绍：
 
-### 1. 带宽限制 (Bandwidth Limit)
-这个功能旨在限制服务器的网络接口在一个设定的时间周期（通常是一个月）内使用的总带宽量。它通过监控网络接口的数据流量来实现，一旦达到设定的阈值，就会触发关机，避免产生预期外的费用。
+## General options
 
-**实现方法**：
-- 用户需要指定月带宽上限（GB）和带宽刷新日。刷新日是指每个月带宽计量重置的日期。
-- 当达到设定的带宽阈值时，脚本将会触发关机。
+| Option | Meaning |
+|---|---|
+| `-y`, `--yes` | Assume yes for yes/no confirmations where the script considers it safe. |
+| `--dry-run` | Preview changes; commands are logged but not executed. |
+| `--allow-older-bbrv3-kernel` | Explicitly allow a BBRv3 payload older than the highest installed/running non-BBRv3 kernel. `--yes` never implies this option. |
+| `-v`, `--verbose` | Show step-level progress, commands, and generated file content. |
+| `--zh-cn` | Shortcut for `--lang zh-CN`. |
+| `--en` | Shortcut for `--lang en`. |
+| `-h`, `--help` | Show help. |
 
-### 2. 带宽限制 (CPU Abuse Shutdown)
-此功能用于在CPU使用率超过设定的阈值时自动关闭服务器，以防止因过度使用CPU而导致的资源滥用。
-#### 实现方法
+`-y` remains the upstream "assume yes" option. BBRy uses `-Y` (uppercase) or `--bbry`; this intentionally resolves the short-option conflict in the old fork.
 
--   用户需要设置一个CPU使用率的上限值（百分比）。当系统监测到CPU使用率持续超过此阈值时，会触发自动关机操作。
--   脚本通过周期性检查系统的CPU使用率来实现此功能。如果CPU使用率连续30分钟超过设定阈值，脚本将执行关机命令。
+## Network and disk tuning behavior
 
-### 3. DDoS自动关机 (DDoS Auto Shutdown)
-这个功能用于增加服务器在遭受DDoS（分布式拒绝服务）攻击时的安全性。通过监控网络流量异常增长来检测潜在的DDoS攻击，一旦检测到攻击，自动关闭服务器以保护系统和数据。
+- On bare metal, ring buffers use a speed-based target: 1 Gbit/s and below uses 1024, up to 10 Gbit/s uses 4096, and faster links use 8192. Each value is capped at the maximum reported by `ethtool -g`; unreadable values are skipped instead of guessed.
+- The primary IPv4 default route is updated with `initcwnd 100` and `initrwnd 100` using an argument array. The route is never deleted, `eval` is not used, and the result is verified immediately. A timer reapplies the network settings one minute after boot and every five minutes thereafter, so routes recreated by the network manager are corrected.
+- Disk scheduler tuning checks each device's supported scheduler list. NVMe prefers `none`, SATA SSD prefers `kyber`, and HDD prefers `mq-deadline`, with supported fallbacks. Loop, RAM, optical, device-mapper, and MD devices are skipped.
+- Disk scheduler changes are skipped in VMs and containers. The action installs `tune-disk-scheduler.service` instead of broad udev rules.
 
-**实现方法**：
-- 设置阈值，包括Mbps（兆比特每秒）和pps（每秒数据包数量），以确定何时认为是DDoS攻击。
-- 如果在设定时间内（例如10分钟）持续超过阈值，则自动执行关机操作。
+## BBR variants
 
-### 4. SSH安全设置 (SSH Security Settings)
-此功能提高SSH服务的安全性，包括更改默认端口、禁用密码认证和启用基于密钥的认证。
+| Variant | Supported systems | Installation behavior |
+|---|---|---|
+| BBRx | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
+| BBRy | Debian except 13; Ubuntu | Attempts a DKMS build against the running kernel; the actual kernel headers/API are the final compatibility check. |
+| BBRz | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
+| BBRv3 | Installer support: Debian 11/12/13 and Ubuntu 22.04/24.04/26.04 on amd64; Debian 13 on arm64 | Installs the pinned prebuilt 6.13.7 non-LTS kernel and requires a reboot into that kernel. |
 
-**实现方法**：
-- 用户可以更改SSH服务的端口号，这有助于避免自动化的网络扫描工具发现。
-- 禁用密码认证并启用基于密钥的认证，这种方式比传统密码认证更为安全，因为它依赖于密钥对而非可破解的密码。
-- 还包括配置Fail2ban工具，它能够监控登录尝试，并在检测到恶意尝试时自动封禁IP地址。
+BBRx, BBRy, and BBRz sources are pinned to `guowanghushifu/Seedbox-Components` commit `802fada1488bfbb9540a5740082d557aa88f8d6b`. The script verifies a hard-coded SHA-256 before DKMS sees the source, creates its own `Makefile` and `dkms.conf`, loads the module, and verifies both availability and the active congestion-control setting. It does not schedule a reboot.
 
-### 4. 系统调优 (System Tuning)
-这个功能通过调整各种系统和网络参数来优化服务器的性能。
+On Debian 13, Tune rejects BBRy before installing packages or downloading source because the pinned BBRy source is incompatible with the tested kernel API. Install BBRx or BBRz instead.
 
-**实现方法**：
-- **内核参数调整**：例如，增加TCP缓冲区大小、修改系统队列长度等，这些改变有助于提高网络吞吐量和减少延迟。
-- **性能优化**：安装和配置`Tuned`和其他系统性能优化工具来自动调整和优化服务器的运行状态。
-- **资源限制**：例如，设置文件打开数量的限制，这可以防止某些类型的资源耗尽攻击。
+BBRv3 uses `jerry048/Dedicated-Seedbox` installer commit `97470df47a948b0f39082e7679c630eaeff438d1`, whose script SHA-256 is also pinned. Its kernel payload is pinned separately to `jerry048/Trove` commit `8131d4b005c20ae1d73be545b1c5d8ebc435ad1`; the selected package is verified against that commit's `SHA256SUMS` manifest. `TUNE_BBRV3_RAW_BASE` may point to an exact mirror of this pinned payload. Content containing a different kernel version is unsupported because the safety check assumes the pinned 6.13.7 payload.
 
-通过这些功能，你的服务器不仅能够更有效地管理资源，还能提高对外部威胁的防护能力，保障系统稳定运行。
+Before downloading the installer or changing packages, Tune compares the 6.13.7 payload with the highest numeric kernel version found among the running non-BBRv3 kernel and installed `linux-image-*` packages, excluding BBRv3 packages. If the reference kernel is newer, installation stops. `--yes` cannot bypass this check; an intentional experiment requires the dedicated `--allow-older-bbrv3-kernel` option. Dry-run performs the same read-only check and reports both versions.
 
-## 注意
+After installation, Tune locates the installed BBRv3 kernel in the generated GRUB menu and uses `grub-reboot` to select it for the next boot only. It does not change the persistent GRUB default and does not reboot automatically. This matters when the distro kernel has a numerically higher version and would otherwise remain the default; after the one-time BBRv3 boot, a later reboot falls back to the distro default unless BBRv3 is selected again.
 
-- 在使用脚本前请确保您具有root用户权限。
-- 在执行SSH安全设置时，请仔细跟随指示操作，以避免不必要的服务中断。
-- 使用DDoS自动关机功能时，需要确保已正确配置阈值以避免误操作。
-- 部分功能如BBRx和BBRv3安装可能需要重启系统以生效。
-- 系统参数调整可能需要根据具体的系统配置和需求进行微调。
+Only one BBR variant may be selected per run. Test every BBR action on a disposable VM that matches the production OS, architecture, and kernel before using it on a production seedbox; a DKMS build succeeding on one kernel does not establish compatibility with another.
 
-最后，请在使用此脚本前备份重要数据，以防万一出现不可预见的问题。
+Examples:
+
+```bash
+sudo ./tune.sh --dry-run --verbose --bbrx
+sudo ./tune.sh --bbry       # uppercase short form: -Y
+sudo ./tune.sh --bbrz
+sudo ./tune.sh --bbrv3      # reboot manually after a successful install
+sudo ./tune.sh --bbrv3 --allow-older-bbrv3-kernel  # explicit high-risk override
+```
+
+## SSH hardening safety
+
+The SSH action is intentionally staged:
+
+1. It adds the new SSH port while keeping the current port active.
+2. It asks you to open a second SSH session and verify the new port.
+3. Only after confirmation does it finalize the new SSH port.
+4. It disables password authentication only after you confirm SSH key login works.
+
+Recommended command:
+
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh) --ssh-security
+```
+
+After it completes, verify from another terminal:
+
+```bash
+ssh -p <new-port> root@<server-ip>
+sshd -T | grep -E '^(port|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication) '
+fail2ban-client ping
+fail2ban-client status sshd
+```
+
+This version also waits and retries `fail2ban-client ping` after restarting `fail2ban`, which avoids a short startup race where the service is running but the client socket is not ready yet.
+
+## Logs and troubleshooting
+
+Logs are stored under `/var/log/tune`:
+
+```text
+/var/log/tune/<run-id>.log
+/var/log/tune/<run-id>-<step>.log
+```
+
+Use verbose mode to see each step while it runs:
+
+```bash
+sudo ./tune.sh --verbose -t
+```
+
+Useful diagnostics:
+
+```bash
+journalctl -u fail2ban.service --no-pager -n 120
+journalctl -u ssh.service --no-pager -n 120
+journalctl -u tune-boot-apply.service --no-pager -n 120
+systemctl list-timers tune-boot-apply.timer --no-pager
+journalctl -u tune-disk-scheduler.service --no-pager -n 120
+dkms status
+sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
+```
+
+On Ubuntu systems where the SSH unit is named `sshd.service`, use that unit name instead of `ssh.service`.
+
+## Files managed by the script
+
+Depending on selected actions, the script may create or update:
+
+```text
+/etc/sysctl.d/90-tune.conf
+/etc/security/limits.d/90-tune.conf
+/etc/systemd/system.conf.d/90-tune.conf
+/etc/ssh/sshd_config.d/99-tune.conf
+/etc/fail2ban/jail.d/sshd-tune.local
+/etc/sysctl.d/90-tune-bbr.conf
+/etc/modules-load.d/90-tune-bbr.conf
+/etc/tune/*.env
+/usr/local/sbin/tune-*-guard
+/usr/local/sbin/tune-boot-apply
+/usr/local/sbin/tune-disk-scheduler-apply
+/etc/systemd/system/tune-disk-scheduler.service
+/etc/systemd/system/tune-*.service
+/etc/systemd/system/tune-*.timer
+/usr/src/{bbrx,bbry,bbrz}-1.0.0.802fada/
+```
+
+The BBRv3 installer additionally manages `/etc/sysctl.d/90-bbr-congestion-control.conf`, and Tune writes a one-time `next_entry` to `/boot/grub/grubenv` when GRUB is available. Tune keeps `/etc/sysctl.d/90-tune.conf` aligned with the selected BBR variant so later sysctl load order does not silently override it.
+
+Existing files that need direct modification are backed up with a `.bak.<run-id>` suffix where applicable.
+
+## Recovery notes
+
+If SSH changes fail validation, the script stops before applying them. If you confirmed a new SSH port and later need to revert manually, inspect:
+
+```bash
+ls -l /etc/ssh/sshd_config.bak.*
+cat /etc/ssh/sshd_config.d/99-tune.conf
+sshd -t
+systemctl reload ssh || systemctl restart ssh
+```
+
+For failed package operations, repair `dpkg`/`apt` first:
+
+```bash
+dpkg --configure -a
+apt-get -f install
+apt-get update
+```

@@ -1,1870 +1,2760 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# tune.sh
+# Debian/Ubuntu server hardening and network tuning helper.
+#
+# Goals:
+#   - readable progress/status output
+#   - concise default output with detailed per-step logs under /var/log/tune
+#   - Debian/Ubuntu-only compatibility
+#   - Debian 13-compatible sysctl.d usage
+#   - safer defaults than the original script
 
-# Ensure the script is run as root
-if [ "$(id -u)" != "0" ]; then
-	echo "脚本需要root运行." 1>&2
-	exit 1
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly LOG_DIR="${LOG_DIR:-/var/log/tune}"
+readonly CONFIG_DIR="${CONFIG_DIR:-/etc/tune}"
+readonly BIN_DIR="${BIN_DIR:-/usr/local/sbin}"
+readonly SYSCTL_FILE="/etc/sysctl.d/90-tune.conf"
+readonly LIMITS_FILE="/etc/security/limits.d/90-tune.conf"
+readonly SYSTEMD_LIMITS_DIR="/etc/systemd/system.conf.d"
+readonly SYSTEMD_LIMITS_FILE="${SYSTEMD_LIMITS_DIR}/90-tune.conf"
+readonly SSHD_CONFIG="/etc/ssh/sshd_config"
+readonly SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
+readonly SSHD_DROPIN="${SSHD_DROPIN_DIR}/99-tune.conf"
+readonly DISK_SCHEDULER_HELPER="${BIN_DIR}/tune-disk-scheduler-apply"
+readonly DISK_SCHEDULER_SERVICE="/etc/systemd/system/tune-disk-scheduler.service"
+readonly BBR_SOURCE_COMMIT="802fada1488bfbb9540a5740082d557aa88f8d6b"
+readonly BBR_SOURCE_BASE="https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/${BBR_SOURCE_COMMIT}/BBR/BBRx"
+readonly BBR_DKMS_VERSION="1.0.0.802fada"
+readonly BBR_SYSCTL_FILE="/etc/sysctl.d/90-tune-bbr.conf"
+readonly BBR_MODULES_FILE="/etc/modules-load.d/90-tune-bbr.conf"
+readonly BBRV3_INSTALLER_COMMIT="97470df47a948b0f39082e7679c630eaeff438d1"
+readonly BBRV3_INSTALLER_URL="https://raw.githubusercontent.com/jerry048/Dedicated-Seedbox/${BBRV3_INSTALLER_COMMIT}/lib/components/bbr/BBRInstall.sh"
+readonly BBRV3_INSTALLER_SHA256="9b8c099c90d5707bdeae57b460b525865d55981c2f37c1814257a30a130cbe8f"
+readonly BBRV3_PAYLOAD_COMMIT="8131d4b005c20ae1d73be545b1c5d8ebc435ad1d"
+readonly BBRV3_PAYLOAD_BASE="https://raw.githubusercontent.com/jerry048/Trove/${BBRV3_PAYLOAD_COMMIT}/BBR-Install/BBR"
+readonly BBRV3_PAYLOAD_KERNEL_VERSION="6.13.7"
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_LOG="${LOG_DIR}/${RUN_ID}.log"
+ASSUME_YES=0
+ALLOW_OLDER_BBRV3_KERNEL=0
+DRY_RUN=0
+VERBOSE=0
+LANGUAGE="${TUNE_LANG:-en}"
+OS_ID=""
+OS_NAME=""
+OS_VERSION_ID=""
+OS_MAJOR=0
+VIRT_TECH="none"
+VIRT_KIND="none"
+PRIMARY_IFACE=""
+SSH_SERVICE=""
+
+# Action/status tracking
+declare -a ACTIONS=()
+declare -a SUMMARY_LABELS=()
+declare -a SUMMARY_RESULTS=()
+declare -a SUMMARY_LOGS=()
+CURRENT_ACTION_LOGS=()
+LAST_STEP_LOG=""
+LAST_FAILURE_CAUSE=""
+
+# Color setup. Color is disabled automatically for non-TTY output.
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+    C_RESET="$(tput sgr0)"
+    C_INFO="$(tput setaf 6)"
+    C_OK="$(tput setaf 2)"
+    C_WARN="$(tput setaf 3)"
+    C_ERR="$(tput setaf 1)"
+    C_BOLD="$(tput bold)"
+else
+    C_RESET=""
+    C_INFO=""
+    C_OK=""
+    C_WARN=""
+    C_ERR=""
+    C_BOLD=""
 fi
 
-## Text colors and styles
-info() {
-	echo -e "\e[92m$1\e[0m"
-}
-info_2() {
-	echo -e "\e[94m$1\e[0m"
-}
-fail() {
-	echo -e "\e[91m$1\e[0m" 1>&2
-}
-seperator() {
-	echo -e "\n"
-	echo $(printf '%*s' "$(tput cols)" | tr ' ' '=')
+
+set_language() {
+    local requested="${1:-en}"
+    case "${requested,,}" in
+        en|en-us|en_us|english)
+            LANGUAGE="en"
+            ;;
+        zh|zh-cn|zh_cn|zh-hans|zh_hans|cn|sc|simplified-chinese|simplified_chinese|chinese)
+            LANGUAGE="zh-CN"
+            ;;
+        *)
+            error "Unsupported language: ${requested}. Use en or zh-CN."
+            return 1
+            ;;
+    esac
 }
 
-## Loading animation
-BLA_classic=( 0.25 '-' "\\" '|' '/' )
-declare -a BLA_active_loading_animation
-
-BLA::play_loading_animation_loop() {
-  while true ; do
-    for frame in "${BLA_active_loading_animation[@]}" ; do
-      printf "\r%s" "${frame}"
-      sleep "${BLA_loading_animation_frame_interval}"
+preparse_language() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --lang=*)
+                set_language "${1#*=}" || return 1
+                ;;
+            --lang)
+                if [[ "$#" -gt 1 ]]; then
+                    set_language "$2" || return 1
+                    shift
+                fi
+                ;;
+            --zh|--zh-cn|--zh-CN)
+                set_language zh-CN || return 1
+                ;;
+            --en|--english)
+                set_language en || return 1
+                ;;
+        esac
+        shift || true
     done
-  done
 }
 
-BLA::start_loading_animation() {
-  BLA_active_loading_animation=( "${@}" )
-  # Extract the delay between each frame from array BLA_active_loading_animation
-  BLA_loading_animation_frame_interval="${BLA_active_loading_animation[0]}"
-  unset "BLA_active_loading_animation[0]"
-  tput civis # Hide the terminal cursor
-  BLA::play_loading_animation_loop &
-  BLA_loading_animation_pid="${!}"
-}
-
-BLA::stop_loading_animation() {
-  kill "${BLA_loading_animation_pid}" &> /dev/null
-  printf "\n"
-  tput cnorm # Restore the terminal cursor
-}
-# Run BLA::stop_loading_animation if the script is interrupted
-trap BLA::stop_loading_animation SIGINT
-
-## System Info
-sysinfo_(){
-	#Linux Distro Version
-	if [ -f /etc/os-release ]; then
-		. /etc/os-release
-		os=$NAME
-		ver=$VERSION_ID
-	elif type lsb_release >/dev/null 2>&1; then
-		os=$(lsb_release -si)
-		ver=$(lsb_release -sr)
-	elif [ -f /etc/lsb-release ]; then
-		. /etc/lsb-release
-		os=$DISTRIB_ID
-		ver=$DISTRIB_RELEASE
-	elif [ -f /etc/debian_version ]; then
-		os=Debian
-		ver=$(cat /etc/debian_version)
-	elif [ -f /etc/redhat-release ]; then
-		os=Redhat
-	else
-		os=$(uname -s)
-		ver=$(uname -r)
-	fi
-
-	#Virtualization Technology
-	if [ $(systemd-detect-virt) != "none" ]; then
-		virt_tech=$(systemd-detect-virt)
-	fi
-
-	#Memory Size
-	mem_size=$(free -m | grep Mem | awk '{print $2}')
-
-	#Network interface
-	nic=$(ip addr | grep 'state UP' | awk '{print $2}' | sed 's/.$//' | cut -d'@' -f1 | head -1)
-
-	return 0
-}
-
-## Update
-update_() {
-	if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-		apt-get update -y && apt-get upgrade -y
-	elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-		yum update -y
-	fi
-	return 0
-}
-
-## Auto update
-auto_update_() {
-	if [ -z $(which unattended-upgrades) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get -y install unattended-upgrades apt-listchanges
-			if [ $? -ne 0 ]; then
-				fail "Unattended-upgrades Installation Failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install unattended-upgrades -y
-			if [ $? -ne 0 ]; then
-				fail "Unattended-upgrades Installation Failed"
-				return 1
-			fi
-		fi
-	fi
-	echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections
-	dpkg-reconfigure -f noninteractive unattended-upgrades
-}
-
-## Bandwidth Limit
-bandwidth_limit_() {
-	# Install vnstat if not already installed
-	if ! [ -x "$(command -v vnstat)" ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install vnstat -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install vnstat -y
-		fi
-	fi
-	if ! [ -x "$(command -v vnstat)" ]; then
-		fail "vnstat 安装失败"
-		return 1
-	fi
-	# Install bc if	not already installed
-	if ! [ -x "$(command -v bc)" ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install bc -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install bc -y
-		fi
-	fi
-	if ! [ -x "$(command -v bc)" ]; then
-		fail "bc 安装失败"
-		return 1
-	fi
-	sed -i "s/Interface \"\"/Interface \"$nic\"/" /etc/vnstat.conf
-    cat << EOF > /root/.bandwidth_limit.sh
-#!/bin/bash
-
-# Set the monthly limit in GiB
-monthly_upload_limit=$upload_threshold
-monthly_download_limit=$download_threshold
-reset_day=$reset_day
-
-while true
-do
-	# Get the current date and time
-	current_year=\$(date +%Y)
-	current_month=\$(date +%m)
-	current_day=\$(date +%d)
-
-	# Calculate the begin and end dates for vnStat
-	if [[ \$current_day -ge \$reset_day ]]; then
-		begin_date="\$current_year-\$current_month-\$reset_day"
-		next_month=\$(date -d "\$begin_date +1 month" +%m)
-		next_year=\$(date -d "\$begin_date +1 month" +%Y)
-		end_date="\$next_year-\$next_month-\$reset_day"
-	else
-		end_date="\$current_year-\$current_month-\$reset_day"
-		prev_month=\$(date -d "\$end_date -1 month" +%m)
-		prev_year=\$(date -d "\$end_date -1 month" +%Y)
-		begin_date="\$prev_year-\$prev_month-\$reset_day"
-	fi
-
-	# Get the current usage
-	current_upload_usage=\$(vnstat --begin \$begin_date --end \$end_date -i "$nic" --oneline | awk -F\; '{print \$10}')
-	current_upload_usage_value=\$(echo \$current_upload_usage| awk '{print \$1}')
-	current_upload_usage_unit=\$(echo \$current_upload_usage | awk '{print \$2}')
-
-	current_download_usage=\$(vnstat --begin \$begin_date --end \$end_date -i "$nic" --oneline | awk -F\; '{print \$9}')
-	current_download_usage_value=\$(echo \$current_download_usage| awk '{print \$1}')
-	current_download_usage_unit=\$(echo \$current_download_usage | awk '{print \$2}')
-
-	# Convert usage to GiB
-	case \$current_upload_usage_unit in
-		"KiB") current_upload_usage_in_gib=\$(echo "scale=2; \$current_upload_usage_value / 1048576" | bc) ;;
-		"MiB") current_upload_usage_in_gib=\$(echo "scale=2; \$current_upload_usage_value / 1024" | bc) ;;
-		"GiB") current_upload_usage_in_gib=\$current_upload_usage_value ;;
-		"TiB") current_upload_usage_in_gib=\$(echo "scale=2; \$current_upload_usage_value * 1024" | bc) ;;
-		*) echo "Unknown unit: \$unit" >&2; exit 1 ;;
-	esac
-	case \$current_download_usage_unit in
-		"KiB") current_download_usage_in_gib=\$(echo "scale=2; \$current_download_usage_value / 1048576" | bc) ;;
-		"MiB") current_download_usage_in_gib=\$(echo "scale=2; \$current_download_usage_value / 1024" | bc) ;;
-		"GiB") current_download_usage_in_gib=\$current_download_usage_value ;;
-		"TiB") current_download_usage_in_gib=\$(echo "scale=2; \$current_download_usage_value * 1024" | bc) ;;
-		*) echo "Unknown unit: \$unit" >&2; exit 1 ;;
-	esac
-
-	# Check if the current usage exceeds the limit
-	if (( \$(echo "\$current_upload_usage_in_gib >= \$monthly_upload_limit" | bc -l) )); then
-		shutdown -h now
-	fi
-	if (( \$(echo "\$current_download_usage_in_gib >= \$monthly_download_limit" | bc -l) )); then
-		shutdown -h now
-	fi
-
-	sleep 5
-done
-EOF
-	chmod +x .bandwidth_limit.sh
-	#Systemd Service
-	cat << EOF > /etc/systemd/system/bandwidth_limit.service
-[Unit]
-Description=Bandwidth Limit
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/root/.bandwidth_limit.sh
-Restart=always
-RestartSec=3
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=bandwidth_limit
-	
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable bandwidth_limit
-	systemctl start bandwidth_limit
-	return 0
-}
-
-## CPU Abuse shutdown
-cpu_abuse_shutdown_() {
-	# Install bc if	not already installed
-	if ! [ -x "$(command -v bc)" ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install bc -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install bc -y
-		fi
-	fi
-	if ! [ -x "$(command -v bc)" ]; then
-		fail "bc 安装失败"
-		return 1
-	fi
-	cat << EOF > /root/.cpu_abuse_shutdown.sh
-#!/bin/bash
-# Set the CPU usage limit
-cpu_limit=$cpu_limit
-
-while true
-do
-	# Get the current CPU usage
-	cpu_usage=\$(top -bn2 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - \$1}' | tail -1)
-
-	# Check if the usage exceeds the limit
-	if (( \$(echo "\$cpu_usage >= \$cpu_limit" | bc -l) )); then
-		((excess_usage_counter++))
-	else
-		((excess_usage_counter--))
-	fi
-
-	if [[ \$excess_usage_counter -ge 180 ]]; then
-		shutdown -h now
-	fi
-	sleep 10
-done
-EOF
-	chmod +x .cpu_abuse_shutdown.sh
-	#Systemd Service
-	cat << EOF > /etc/systemd/system/cpu_abuse_shutdown.service
-[Unit]
-Description=CPU Abuse Shutdown
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/root/.cpu_abuse_shutdown.sh
-Restart=always
-RestartSec=3
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=cpu_abuse_shutdown
-
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable cpu_abuse_shutdown
-	systemctl start cpu_abuse_shutdown
-	return 0
-}
-
-## DDoS Auto Shutdown
-ddos_shutdown_() {
-	# Install vnstat if not already installed
-	if ! [ -x "$(command -v vnstat)" ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install vnstat -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install vnstat -y
-		fi
-	fi
-	if ! [ -x "$(command -v vnstat)" ]; then
-		fail "vnstat 安装失败"
-		return 1
-	fi
-	# Install jq if not already installed
-	if ! [ -x "$(command -v jq)" ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install jq -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install jq -y
-		fi
-	fi
-	if ! [ -x "$(command -v jq)" ]; then
-		fail "jq 安装失败"
-		return 1
-	fi
-	cat << EOF > /root/.ddos_shutdown.sh
-#!/bin/bash
-byte_limit=\$(($speed_limit * 1000 * 1000 / 8)) 
-packet_limit=\$(($packet_limit))
-
-while true
-do
-	# Get current bandwidth usage
-	byte_rate=\$(vnstat -tr 30 --json | jq '.rx.bytespersecond + .tx.bytespersecond')
-	# Get current packet rate
-	packet_rate=\$(vnstat -tr 30 --json | jq '.rx.packetspersecond + .tx.packetspersecond')
-
-	# Check if the usage exceeds the limit
-	if [[ \$byte_rate -gt \$byte_limit ]] || [[ \$packet_rate -gt \$packet_limit ]] ; then
-		((excess_usage_counter++))
-	else
-		excess_usage_counter=0
-	fi
-
-	# If the usage exceeds the limit for 10 minutes, shut down the server
-	if [[ \$excess_usage_counter -ge 10 ]]; then
-		shutdown -h now
-	fi
-done
-EOF
-	chmod +x .ddos_shutdown.sh
-	#Systemd Service
-cat << EOF > /etc/systemd/system/ddos_shutdown.service
-[Unit]
-Description=DDoS Shutdown
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/root/.ddos_shutdown.sh
-Restart=always
-RestartSec=3
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=ddos_shutdown
-
-[Install]
-WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable ddos_shutdown
-	systemctl start ddos_shutdown
-
-	return 0
-}
-
-
-## SSH Security Settings
-ssh_secure_() {
-	# Ask for the new SSH port
-	read -p "新SSH端口: " new_ssh_port
-
-	# Check if the input is a valid number
-	while ! [[ $new_ssh_port =~ ^[0-9]+$ ]]; do
-		echo "请输入一个有效的端口号"
-		read -p "新SSH端口: " new_ssh_port
-	done
-
-	# Add the new SSH port without removing the existing one
-	echo "Port $new_ssh_port" >> /etc/ssh/sshd_config
-
-	# Restart SSH service to apply changes
-	systemctl restart sshd
-
-	# Make sure the new SSH port is open
-	read -p "你能使用新SSH端口登录吗? (y/n): " can_login
-	while ! [[ $can_login =~ ^[YyNn]$ ]]; do
-		echo "请输入y或n"
-		read -p "你能使用新SSH端口登录吗? (y/n): " can_login
-	done
-	if [[ $can_login =~ ^[Yy]$ ]]; then
-		# Removing the original SSH port
-		sed -i "0,/Port /s//Old&/" /etc/ssh/sshd_config
-		sed -i '/OldPort/d' /etc/ssh/sshd_config
-
-		# Restart SSH service to apply final changes
-		systemctl restart sshd
-		info_2 "旧SSH端口已关闭"
-	else
-		# Revert the changes
-		sed -i ':a;N;$!ba;s/\(.*\)Port /\1OldPort /' /etc/ssh/sshd_config
-		sed -i '/OldPort/d' /etc/ssh/sshd_config
-		systemctl restart sshd
-		fail "新SSH端口 $new_ssh_port 未打开"
-		fail "旧SSH端口未关闭"
-		return 1
-	fi
-
-	#Disble Root Password Login
-	keys="/root/.ssh/authorized_keys"
-
-	if ! [ -s "$keys" ]; then
-		fail "SSH 钥匙不存在"
-		return 1
-	else
-		sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-		sed -i 's/^PubkeyAuthentication no/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-		unset can_login
-		read -p "你能使用SSH密钥登录吗? (y/n): " can_login
-		while ! [[ $can_login =~ ^[YyNn]$ ]]; do
-			echo "请输入y或n"
-			read -p "你能使用SSH密钥登录吗? (y/n): " can_login
-		done
-		if [[ $can_login =~ ^[Yy]$ ]]; then
-			# Disable password login
-			sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-			sed -i 's/^PermitRootLogin yes/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-			sed -i 's/^PermitRootLogin without-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-			systemctl restart sshd
-			info_2 "Root密码登录已禁用"
-		else
-			fail "SSH密钥登录未启用"
-			return 1
-		fi
-	fi
-	return 0
-}
-
-## Fail2ban
-fail2ban_() {
-	if [ -z $(which fail2ban-client) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install fail2ban -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install fail2ban -y
-		fi
-	fi
-	if [ -z $(which fail2ban-client) ]; then
-		fail "Fail2ban installation failed"
-		return 1
-	fi
-	if [ -z $(which iptables) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install iptables -y
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install iptables -y
-		fi
-	fi
-	if [ -z $(which iptables) ]; then
-		fail "iptables installation failed"
-		return 1
-	fi
-	# Check current ssh port
-	ssh_port=$(ss -tlnp | grep sshd | awk '{print $4}' | cut -d':' -f2 | head -1)
-	touch /etc/fail2ban/jail.local
-	cat << EOF > /etc/fail2ban/jail.local
-[sshd]
-enabled = true
-filter = sshd
-mode   = aggressive
-port    = $ssh_port
-logpath = %(sshd_log)s
-backend=systemd
-banaction = iptables-multiport
-bantime = -1
-maxretry = 3
-findtime = 24h
-EOF
-	systemctl restart fail2ban
-	# Check if fail2ban is running
-	if [ -z $(ps -ef | grep fail2ban | grep -v grep) ]; then
-		fail "Fail2ban failed to start"
-		return 1
-	fi
-	return 0
-}
-
-## System tuning
-#Install Tuned
-tuned_() {
-    if [ -z $(which tuned) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install tuned -y
-			if [ $? -ne 0 ]; then
-				fail "Tuned Installation Failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install tuned -y
-			if [ $? -ne 0 ]; then
-				fail "Tuned Installation Failed"
-				return 1
-			fi
-		fi
-	fi
-	return 0
-}
-#File Open Limit
-set_file_open_limit_() {
-
-    cat << EOF >> /etc/security/limits.conf
-## Hard limit for max opened files
-* soft nofile 655360
-## Soft limit for max opened files
-* hard nofile 655360
-EOF
-	return 0
-}
-#Ring Buffer
-set_ring_buffer_() {
-	if [ -z $(which ethtool) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get -y install ethtool
-			if [ $? -ne 0 ]; then
-				fail "Ethtool Installation Failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install ethtool -y
-			if [ $? -ne 0 ]; then
-				fail "Ethtool Installation Failed"
-				return 1
-			fi
-		fi
-	fi
-	local interface=$nic;
-    # Query current ring buffer parameters
-    ring_info=$(ethtool -g $interface 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        warn "Unable to query ring buffer info for $interface, skipping"
+tr_text() {
+    local text="$*"
+    if [[ "${LANGUAGE:-en}" != "zh-CN" ]]; then
+        printf '%s' "$text"
         return 0
     fi
-    
-    # Extract maximum supported RX and TX
-    max_rx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "RX:" | head -1 | awk '{print $2}')
-    max_tx=$(echo "$ring_info" | grep -A10 "Pre-set maximums:" | grep "TX:" | head -1 | awk '{print $2}')
-    
-    # Extract current RX and TX
-    current_rx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
-    current_tx=$(echo "$ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
-    
-    info "Interface $interface ring buffer info:"
-    info "  RX: current=$current_rx, max=$max_rx"
-    info "  TX: current=$current_tx, max=$max_tx"
-    
-    # Validate parsed max values
-    if ! [[ "$max_rx" =~ ^[0-9]+$ ]] || ! [[ "$max_tx" =~ ^[0-9]+$ ]]; then
-        warn "Failed to parse max values, falling back to conservative defaults"
-        # Use conservative defaults
-        target_rx=512
-        target_tx=512
-    else
-        # Use hardware maximums for best throughput
-        # Pre-set maximums are vendor-guaranteed safe upper bounds
-        target_rx=$max_rx
-        target_tx=$max_tx
-        info "Using max ring buffer values: RX=$target_rx, TX=$target_tx (maximize throughput)"
-    fi
-    
-    info "Target ring buffer: RX=$target_rx, TX=$target_tx"
-    
-    # Apply RX ring buffer
-    if [ "$current_rx" != "$target_rx" ]; then
-        info "Setting RX ring buffer to $target_rx..."
-        ethtool -G $interface rx $target_rx 2>/dev/null
-        if [ $? -eq 0 ]; then
-            success "RX ring buffer set"
-        else
-            warn "Failed to set RX ring buffer; driver may not allow changes"
-        fi
-        sleep 1
-    else
-        info "RX ring buffer already optimal; skipping"
-    fi
-    
-    # Apply TX ring buffer
-    if [ "$current_tx" != "$target_tx" ]; then
-        info "Setting TX ring buffer to $target_tx..."
-        ethtool -G $interface tx $target_tx 2>/dev/null
-        if [ $? -eq 0 ]; then
-            success "TX ring buffer set"
-        else
-            warn "Failed to set TX ring buffer; driver may not allow changes"
-        fi
-        sleep 1
-    else
-        info "TX ring buffer already optimal; skipping"
-    fi
-    
-    # Verify applied settings
-    final_ring_info=$(ethtool -g $interface 2>/dev/null)
-    if [ $? -eq 0 ]; then
-        final_rx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "RX:" | head -1 | awk '{print $2}')
-        final_tx=$(echo "$final_ring_info" | grep -A10 "Current hardware settings:" | grep "TX:" | head -1 | awk '{print $2}')
-        info "Ring buffer configured: RX=$final_rx, TX=$final_tx"
-    fi
-    
-    return 0
+
+    if [[ "$text" =~ ^START:\ (.*)$ ]]; then printf '开始：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^[[:space:]][[:space:]]Command:\ (.*)$ ]]; then printf '  命令：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^[[:space:]][[:space:]]Log:\ (.*)$ ]]; then printf '  日志：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^OK:\ (.*)$ ]]; then printf '成功：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^DRY-RUN\ OK:\ (.*)$ ]]; then printf '试运行成功：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^Action:\ (.*)$ ]]; then printf '操作：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^Installing\ packages:\ (.*)$ ]]; then printf '正在安装软件包：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Install\ packages:\ (.*)$ ]]; then printf '安装软件包：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Packages\ already\ installed:\ (.*)$ ]]; then printf '软件包已安装：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Back\ up\ (.*)$ ]]; then printf '备份 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Backup\ created:\ (.*)$ ]]; then printf '已创建备份：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Wrote\ (.*)\.\ A\ reboot\ or\ systemd\ daemon-reexec\ is\ required\ for\ manager-wide\ defaults\.$ ]]; then printf '已写入 %s。需要重启或执行 systemd daemon-reexec 后，管理器级默认限制才会生效。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Wrote\ (.*)$ ]]; then printf '已写入 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Installed\ (.*)$ ]]; then printf '已安装 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Enable\ and\ start\ (.*)$ ]]; then printf '启用并启动 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Disable\ direct\ boot\ activation\ of\ (.*)$ ]]; then printf '停用 %s 的直接开机启动' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Check\ (.*)\ is\ active$ ]]; then printf '检查 %s 是否正在运行' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^To\ diagnose\ (.*):\ (.*)$ ]]; then printf '诊断 %s：%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Likely\ cause:\ (.*)$ ]]; then printf '可能原因：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^Relevant\ log:\ (.*)$ ]]; then printf '相关日志：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Last\ log\ lines:$ ]]; then printf '日志最后几行：'; return 0; fi
+    if [[ "$text" =~ ^DRY-RUN:\ would\ write\ (.*)$ ]]; then printf '试运行：将写入 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^DRY-RUN:\ would\ insert\ Include\ (.*)\ at\ top\ of\ (.*)$ ]]; then printf '试运行：将在 %s 顶部插入 Include %s' "${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^DRY-RUN:\ would\ comment\ global\ Port\ directives\ in\ (.*)$ ]]; then printf '试运行：将注释 %s 中的全局 Port 指令' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^DRY-RUN:\ would\ write\ temporary\ SSH\ drop-in\ (.*)$ ]]; then printf '试运行：将写入临时 SSH drop-in 文件 %s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Assuming\ yes:\ (.*)$ ]]; then printf '自动确认 yes：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^Interactive\ input\ is\ required\ for:\ (.*)$ ]]; then printf '需要交互式输入：%s' "$(tr_text "${BASH_REMATCH[1]}")"; return 0; fi
+    if [[ "$text" =~ ^Enter\ a\ number\ between\ ([0-9]+)\ and\ ([0-9]+)\.$ ]]; then printf '请输入 %s 到 %s 之间的数字。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Invalid\ option:\ (.*)$ ]]; then printf '无效选项：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Unexpected\ argument:\ (.*)$ ]]; then printf '意外参数：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Unsupported\ language:\ (.*)\.\ Use\ en\ or\ zh-CN\.$ ]]; then printf '不支持的语言：%s。请使用 en 或 zh-CN。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Detected\ system:\ (.*),\ virtualization:\ (.*),\ primary\ interface:\ (.*)$ ]]; then printf '检测到系统：%s，虚拟化：%s，主网卡：%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; return 0; fi
+    if [[ "$text" =~ ^Detected\ interface\ has\ unexpected\ characters\ and\ will\ not\ be\ used:\ (.*)$ ]]; then printf '检测到的网卡名称包含异常字符，将不使用：%s' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Port\ ([0-9]+)\ already\ appears\ to\ be\ listening\.\ SSH\ may\ already\ use\ it,\ or\ another\ service\ may\ conflict\.$ ]]; then printf '端口 %s 看起来已在监听。可能是 SSH 已使用该端口，或有其他服务冲突。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Open\ a\ second\ SSH\ session\ now\ and\ verify\ that\ port\ ([0-9]+)\ works\ before\ continuing\.$ ]]; then printf '现在请打开第二个 SSH 会话，并在继续前确认端口 %s 可以登录。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Can\ you\ log\ in\ through\ SSH\ port\ ([0-9]+)\?$ ]]; then printf '你能通过 SSH 端口 %s 登录吗？' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^SSH\ now\ listens\ on\ port\ ([0-9]+)\.\ Existing\ global\ Port\ directives\ were\ backed\ up/commented\.$ ]]; then printf 'SSH 现在监听端口 %s。现有全局 Port 指令已备份并注释。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Allow\ SSH\ port\ ([0-9]+)/tcp\ in\ UFW$ ]]; then printf '在 UFW 中放行 SSH 端口 %s/tcp' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Initialize\ vnStat\ database\ for\ (.*)$ ]]; then printf '初始化 %s 的 vnStat 数据库' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Set\ RX\ ring\ buffer\ on\ (.*)$ ]]; then printf '设置 %s 的 RX 环形缓冲区' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Set\ TX\ ring\ buffer\ on\ (.*)$ ]]; then printf '设置 %s 的 TX 环形缓冲区' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Ring\ buffer\ target\ for\ (.*):\ ([0-9]+)\ \(RX\ ([0-9]+)/([0-9]+),\ TX\ ([0-9]+)/([0-9]+)\)$ ]]; then printf '%s 的环形缓冲区目标：%s（RX %s/%s，TX %s/%s）' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"; return 0; fi
+    if [[ "$text" =~ ^Disable\ TSO/GSO/GRO\ offloads\ on\ (.*)$ ]]; then printf '关闭 %s 的 TSO/GSO/GRO 卸载' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Set\ txqueuelen\ on\ (.*)$ ]]; then printf '设置 %s 的 txqueuelen' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Apply\ sysctl\ tuning\ from\ (.*)$ ]]; then printf '应用来自 %s 的 sysctl 调优' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Starting\ (.*)\.\ Main\ log:\ (.*)$ ]]; then printf '开始运行 %s。主日志：%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Check\ fail2ban\ status$ ]]; then printf '检查 fail2ban 状态'; return 0; fi
+    if [[ "$text" =~ ^Container\ detected\ \((.*)\)\.\ Skipping\ sysctl\ tuning\ because\ many\ kernel\ parameters\ are\ controlled\ by\ the\ host\.$ ]]; then printf '检测到容器（%s）。跳过 sysctl 调优，因为许多内核参数由宿主机控制。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^BBR\ is\ not\ available\ in\ the\ current\ kernel\;\ keeping\ congestion\ control\ as\ (.*)\.$ ]]; then printf '当前内核不支持 BBR；保持拥塞控制为 %s。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^BBRv3\ kernel\ safety\ check:\ distribution\ ([^,]+),\ payload\ (.+)\.$ ]]; then printf 'BBRv3 内核安全检查：发行版 %s，payload %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Refusing\ BBRv3\ because\ payload\ kernel\ ([^[:space:]]+)\ is\ older\ than\ distribution\ kernel\ ([^[:space:]]+)\.$ ]]; then printf '拒绝安装 BBRv3：payload 内核 %s 低于发行版内核 %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Explicit\ override\ accepted:\ BBRv3\ payload\ kernel\ ([^[:space:]]+)\ is\ older\ than\ distribution\ kernel\ ([^[:space:]]+)\.$ ]]; then printf '已接受显式覆盖：BBRv3 payload 内核 %s 低于发行版内核 %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+
+    case "$text" in
+        "Auto updates") printf '自动安全更新' ;;
+        "Bandwidth guard") printf '月流量保护' ;;
+        "CPU guard") printf 'CPU 保护' ;;
+        "Traffic spike guard") printf '流量突增保护' ;;
+        "SSH security") printf 'SSH 安全加固' ;;
+        "Fail2ban") printf 'Fail2ban 防护' ;;
+        "Disk scheduler") printf '磁盘 I/O 调度器' ;;
+        "BBRx") printf 'BBRx' ;;
+        "BBRy") printf 'BBRy' ;;
+        "BBRz") printf 'BBRz' ;;
+        "BBRv3") printf 'BBRv3' ;;
+        "System tuning") printf '系统调优' ;;
+        "SUCCESS") printf '成功' ;;
+        "FAILED") printf '失败' ;;
+        "command") printf '命令' ;;
+        "Update apt package index") printf '更新 APT 软件包索引' ;;
+        "Reload systemd unit files") printf '重新加载 systemd 单元文件' ;;
+        "Enable apt daily timers") printf '启用 APT 每日定时器' ;;
+        "Enable vnStat service") printf '启用 vnStat 服务' ;;
+        "Enable unattended-upgrades with debconf") printf '通过 debconf 启用 unattended-upgrades' ;;
+        "Validate SSH server configuration") printf '验证 SSH 服务器配置' ;;
+        "Reload SSH service") printf '重新加载 SSH 服务' ;;
+        "Restart SSH service") printf '重启 SSH 服务' ;;
+        "Restart fail2ban") printf '重启 fail2ban' ;;
+        "Configuring unattended security updates") printf '正在配置无人值守安全更新' ;;
+        "Configuring monthly bandwidth shutdown guard") printf '正在配置月流量关机保护' ;;
+        "Configuring sustained high-CPU shutdown guard") printf '正在配置持续高 CPU 关机保护' ;;
+        "Configuring traffic spike shutdown guard") printf '正在配置流量突增关机保护' ;;
+        "Configuring SSH hardening") printf '正在配置 SSH 加固' ;;
+        "Installing and configuring fail2ban for SSH") printf '正在为 SSH 安装并配置 fail2ban' ;;
+        "Configuring disk I/O schedulers") printf '正在配置磁盘 I/O 调度器' ;;
+        "Apply disk I/O schedulers now") printf '立即应用磁盘 I/O 调度器' ;;
+        "Applying system tuning") printf '正在应用系统调优' ;;
+        "Set initial congestion window on default route") printf '设置默认路由的初始拥塞窗口' ;;
+        "System tuning completed. Some limits require a reboot or a new login session to fully apply.") printf '系统调优已完成。部分限制需要重启或重新登录后才会完全生效。' ;;
+        "No primary network interface detected.") printf '未检测到主网卡。' ;;
+        "No primary interface detected. Skipping netdev tuning.") printf '未检测到主网卡，跳过网络设备调优。' ;;
+        "Container detected; skipping link queue and route tuning.") printf '检测到容器，跳过链路队列和路由调优。' ;;
+        "Virtual machine or container detected; disk scheduler tuning is skipped.") printf '检测到虚拟机或容器，跳过磁盘调度器调优。' ;;
+        "BBR kernel/DKMS installation is not supported inside a container.") printf '容器中不支持安装 BBR 内核/DKMS 组件。' ;;
+        "BBRx and BBRz support Debian 12 and Debian 13 only.") printf 'BBRx 和 BBRz 仅支持 Debian 12 与 Debian 13。' ;;
+        "BBRy is not supported on Debian 13; install BBRx or BBRz instead.") printf 'Debian 13 不支持 BBRy；请改为安装 BBRx 或 BBRz。' ;;
+        "The running kernel headers are unavailable after package installation.") printf '安装软件包后仍找不到当前运行内核的头文件。' ;;
+        "The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause.") printf 'DKMS 模块构建失败。请查看步骤日志中的编译器输出；源码与内核 API 不匹配是可能原因之一。' ;;
+        "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
+        "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run.") printf '每次运行只能选择 BBRx、BBRy、BBRz 或 BBRv3 中的一个。' ;;
+        "Unable to determine a distribution or running kernel version for the BBRv3 safety check.") printf '无法为 BBRv3 安全检查确定发行版内核或运行内核版本。' ;;
+        "Use --allow-older-bbrv3-kernel to override this safety check explicitly; --yes does not bypass it.") printf '如需显式覆盖此安全检查，请使用 --allow-older-bbrv3-kernel；--yes 不会绕过该检查。' ;;
+        "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
+        "This action requires systemd. The current environment does not appear to be booted with systemd.") printf '此操作需要 systemd。当前环境似乎不是由 systemd 启动。' ;;
+        "This script must be run as root. Try: sudo ./${SCRIPT_NAME} ...") printf '此脚本必须以 root 身份运行。请尝试：sudo ./${SCRIPT_NAME} ...' ;;
+        "Cannot read /etc/os-release. This script supports Debian and Ubuntu only.") printf '无法读取 /etc/os-release。此脚本仅支持 Debian 和 Ubuntu。' ;;
+        "Please answer y or n.") printf '请输入 y 或 n。' ;;
+        "Missing value for --lang. Use en or zh-CN.") printf '缺少 --lang 的值。请使用 en 或 zh-CN。' ;;
+        "No action runs by default. Pass one or more actions explicitly.") printf '默认不会执行任何操作。请明确指定一个或多个操作。' ;;
+        "Dry-run mode is enabled; commands are logged but not executed.") printf '试运行模式已启用；命令会写入日志，但不会执行。' ;;
+        "Keeping the existing SSH configuration. New port was not finalized.") printf '保留现有 SSH 配置。新端口未最终启用。' ;;
+        "Before disabling passwords, verify key login in a second SSH session.") printf '禁用密码前，请在第二个 SSH 会话中确认密钥登录可用。' ;;
+        "Can you log in with an SSH key?") printf '你能使用 SSH 密钥登录吗？' ;;
+        "No /root/.ssh/authorized_keys file was found. Password authentication will not be disabled automatically.") printf '未找到 /root/.ssh/authorized_keys。不会自动禁用密码认证。' ;;
+        "SSH password and keyboard-interactive authentication disabled. Root login is key-only/prohibit-password.") printf '已禁用 SSH 密码和键盘交互认证。root 登录为仅密钥/prohibit-password。' ;;
+        "Password authentication left enabled.") printf '已保留密码认证。' ;;
+        "RX ring tuning skipped; unsupported by this NIC/driver.") printf '已跳过 RX 环形缓冲区调优；此网卡/驱动不支持。' ;;
+        "TX ring tuning skipped; unsupported by this NIC/driver.") printf '已跳过 TX 环形缓冲区调优；此网卡/驱动不支持。' ;;
+        "Ring buffer tuning skipped because link speed or hardware maxima could not be read safely.") printf '无法可靠读取链路速率或硬件上限，已跳过环形缓冲区调优。' ;;
+        "Offload tuning skipped; unsupported by this NIC/driver/hypervisor.") printf '已跳过卸载调优；此网卡/驱动/虚拟化环境不支持。' ;;
+        "txqueuelen tuning skipped.") printf '已跳过 txqueuelen 调优。' ;;
+        "Initial congestion window tuning skipped.") printf '已跳过初始拥塞窗口调优。' ;;
+        "APT/dpkg is locked or interrupted. Another package operation may be running, or dpkg needs repair.") printf 'APT/dpkg 被锁定或中断。可能有其他软件包操作正在运行，或需要修复 dpkg。' ;;
+        "Network, DNS, or package mirror connectivity failed.") printf '网络、DNS 或软件源镜像连接失败。' ;;
+        "A required package is unavailable from the enabled Debian/Ubuntu repositories.") printf '已启用的 Debian/Ubuntu 软件源中没有所需软件包。' ;;
+        "APT repository signature/key verification failed.") printf 'APT 软件源签名/密钥验证失败。' ;;
+        "The command lacked permission, or the host/container blocks that operation.") printf '命令权限不足，或主机/容器阻止了该操作。' ;;
+        "A required command, file, or path was missing.") printf '缺少所需命令、文件或路径。' ;;
+        "The detected network interface is missing or changed name.") printf '检测到的网卡不存在或名称已变化。' ;;
+        "The kernel, network driver, hypervisor, or container does not support that setting.") printf '内核、网络驱动、虚拟化平台或容器不支持该设置。' ;;
+        "The generated SSH configuration failed validation.") printf '生成的 SSH 配置未通过验证。' ;;
+        "A systemd service failed. Use journalctl for that service for more detail.") printf 'systemd 服务失败。请使用 journalctl 查看该服务的更多详情。' ;;
+        "Unknown. Check the log for the command output.") printf '未知。请检查日志中的命令输出。' ;;
+        "Monthly upload limit in GiB:") printf '月上传流量限制（GiB）：' ;;
+        "Monthly download limit in GiB:") printf '月下载流量限制（GiB）：' ;;
+        "Bandwidth reset day of month (1-31):") printf '每月流量重置日（1-31）：' ;;
+        "CPU usage threshold percent (1-100):") printf 'CPU 使用率阈值百分比（1-100）：' ;;
+        "Traffic threshold in Mbps:") printf '流量阈值（Mbps）：' ;;
+        "Packet threshold in packets per second:") printf '包速率阈值（pps）：' ;;
+        "New SSH port (1-65535):") printf '新的 SSH 端口（1-65535）：' ;;
+        "Run summary") printf '运行摘要' ;;
+        *) printf '%s' "$text" ;;
+    esac
 }
-#Disable TSO
-disable_tso_() {
-	if [ -z $(which ethtool) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get -y install ethtool
-			if [ $? -ne 0 ]; then
-				fail "Ethtool Installation Failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install ethtool -y
-			if [ $? -ne 0 ]; then
-				fail "Ethtool Installation Failed"
-				return 1
-			fi
-		fi
-	fi
-	ethtool -K $nic tso off gso off gro off
-	sleep 1
-	return 0
+
+usage() {
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        cat <<USAGE_ZH
+用法：${SCRIPT_NAME} [选项]
+
+默认不会执行任何操作。请明确指定一个或多个操作。
+
+操作：
+  -a, --auto-updates       安装/配置无人值守安全更新
+  -b, --bandwidth-limit    配置月流量超限关机保护
+  -c, --cpu-shutdown       配置持续高 CPU 使用率关机保护
+  -d, --ddos-shutdown      配置流量突增关机保护
+  -f, --fail2ban           独立安装/配置 SSH fail2ban 防护
+  -i, --disk-scheduler     配置裸机磁盘 I/O 调度器及开机服务
+  -s, --ssh-security       加固 SSH，并安装/配置 fail2ban
+  -t, --tune               应用内核/网络调优和周期性网络设备辅助服务
+  -x, --bbrx               从固定并校验的源码安装 BBRx DKMS 模块
+  -Y, --bbry               安装 BBRy DKMS 模块（Debian 13 不支持）
+  -z, --bbrz               从固定并校验的源码安装 BBRz DKMS 模块
+  -3, --bbrv3              通过固定并校验的 Dedicated 安装器安装 BBRv3 内核
+
+通用：
+  -y, --yes                在安全的 yes/no 确认处默认回答 yes
+      --dry-run            预览变更；命令会写入日志但不会执行
+      --allow-older-bbrv3-kernel
+                            允许安装比发行版内核更旧的 BBRv3 payload；--yes 不会隐含此选项
+  -v, --verbose            显示步骤进度、命令和生成的文件内容
+      --lang <en|zh-CN>    选择输出语言：英文或简体中文
+      --zh-cn              等同于 --lang zh-CN
+      --en                 等同于 --lang en
+  -h, --help               显示此帮助
+
+示例：
+  sudo ./${SCRIPT_NAME} -t -s
+  sudo ./${SCRIPT_NAME} --auto-updates --tune --ssh-security
+  sudo ./${SCRIPT_NAME} --lang zh-CN --dry-run --verbose -t
+  sudo TUNE_LANG=zh-CN ./${SCRIPT_NAME} --help
+
+日志：
+  主日志：${LOG_DIR}/<run-id>.log
+  步骤日志：${LOG_DIR}/<run-id>-<step>.log
+USAGE_ZH
+        return 0
+    fi
+
+    cat <<USAGE
+Usage: ${SCRIPT_NAME} [options]
+
+No action runs by default. Pass one or more actions explicitly.
+
+Actions:
+  -a, --auto-updates       Install/configure unattended security updates
+  -b, --bandwidth-limit    Configure monthly bandwidth shutdown guard
+  -c, --cpu-shutdown       Configure sustained high-CPU shutdown guard
+  -d, --ddos-shutdown      Configure traffic spike shutdown guard
+  -f, --fail2ban           Install/configure SSH fail2ban protection independently
+  -i, --disk-scheduler     Configure bare-metal disk I/O schedulers and boot service
+  -s, --ssh-security       Harden SSH and install/configure fail2ban
+  -t, --tune               Apply kernel/network tuning and periodic netdev helper
+  -x, --bbrx               Install BBRx DKMS from pinned, verified source
+  -Y, --bbry               Install BBRy DKMS (not supported on Debian 13)
+  -z, --bbrz               Install BBRz DKMS from pinned, verified source
+  -3, --bbrv3              Install a BBRv3 kernel via the pinned, verified Dedicated installer
+
+General:
+  -y, --yes                Assume yes for yes/no confirmations where safe
+      --dry-run            Preview changes; commands are logged but not executed
+      --allow-older-bbrv3-kernel
+                            Allow an older BBRv3 payload kernel; --yes never implies this
+  -v, --verbose            Show step-level progress, commands, and generated file content
+      --lang <en|zh-CN>    Display script messages in English or Simplified Chinese
+      --zh-cn              Shortcut for --lang zh-CN
+      --en                 Shortcut for --lang en
+  -h, --help               Show this help
+
+Examples:
+  sudo ./${SCRIPT_NAME} -t -s
+  sudo ./${SCRIPT_NAME} --auto-updates --tune --ssh-security
+  sudo ./${SCRIPT_NAME} --lang zh-CN --dry-run --verbose -t
+  sudo TUNE_LANG=zh-CN ./${SCRIPT_NAME} --help
+
+Logs:
+  Main log: ${LOG_DIR}/<run-id>.log
+  Step logs: ${LOG_DIR}/<run-id>-<step>.log
+USAGE
 }
-# Drive
-set_disk_scheduler_() {
-    #List out all the available drives
-    disk=($(lsblk -o NAME,TYPE -n | awk '$2=="disk" {print $1}'))
-    #Count the number of drives
-    diskno=${#disk[@]}
-	#Check if the disk is Set
-	if [[ $diskno -eq 0 ]]; then
-		fail "Disk not found"
-		return 1
-	fi
-    #Changing the scheduler per disk depending on whether they are SSD or HDD
-    for ((i = 0; i < diskno; i++)); do
-	    diskname=${disk[$i]}
-	    disktype=$(cat /sys/block/$diskname/queue/rotational)
-		# SSD
-	    if [ "${disktype}" == 0 ]; then
-		    echo kyber > /sys/block/$diskname/queue/scheduler
-		# HDD
-	    else
-		    echo mq-deadline > /sys/block/$diskname/queue/scheduler
-	    fi
+
+log_file() {
+    local level="$1"
+    shift
+    # Logging must never break help, argument parsing, or non-root error output.
+    if mkdir -p "$LOG_DIR" 2>/dev/null && [[ -w "$LOG_DIR" ]]; then
+        chmod 0700 "$LOG_DIR" 2>/dev/null || true
+        { printf '%s [%s] %s\n' "$(date -Is)" "$level" "$*" >> "$RUN_LOG"; } 2>/dev/null || true
+    fi
+}
+
+say() {
+    local color="$1"
+    shift
+    printf '%b%s%b\n' "$color" "$*" "$C_RESET"
+}
+
+info() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file INFO "$*"
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        say "$C_INFO" "$rendered"
+    fi
+}
+
+notice() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file INFO "$*"
+    say "$C_INFO" "$rendered"
+}
+
+success() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file OK "$*"
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        say "$C_OK" "$rendered"
+    fi
+}
+
+status_ok() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file OK "$*"
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        say "$C_OK" "成功：${rendered}"
+    else
+        say "$C_OK" "OK: ${rendered}"
+    fi
+}
+
+status_failed() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file ERROR "$*"
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        printf '%b%s%b\n' "$C_ERR" "失败：${rendered}" "$C_RESET" >&2
+    else
+        printf '%b%s%b\n' "$C_ERR" "FAILED: ${rendered}" "$C_RESET" >&2
+    fi
+}
+
+warn() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file WARN "$*"
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        printf '%b%s%b\n' "$C_WARN" "警告：${rendered}" "$C_RESET" >&2
+    else
+        printf '%b%s%b\n' "$C_WARN" "WARNING: ${rendered}" "$C_RESET" >&2
+    fi
+}
+
+error() {
+    local rendered
+    rendered="$(tr_text "$*")"
+    log_file ERROR "$*"
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        printf '%b%s%b\n' "$C_ERR" "错误：${rendered}" "$C_RESET" >&2
+    else
+        printf '%b%s%b\n' "$C_ERR" "ERROR: ${rendered}" "$C_RESET" >&2
+    fi
+}
+
+separator() {
+    [[ "$VERBOSE" -eq 1 ]] || return 0
+    local width=80
+    if command -v tput >/dev/null 2>&1; then
+        width="$(tput cols 2>/dev/null || echo 80)"
+    fi
+    printf '\n%*s\n' "$width" '' | tr ' ' '='
+}
+
+slugify() {
+    tr '[:upper:]' '[:lower:]' <<<"$*" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//; s/--*/-/g' | cut -c1-80
+}
+
+quote_args() {
+    local out=""
+    local arg
+    for arg in "$@"; do
+        printf -v out '%s %q' "$out" "$arg"
     done
-	return 0
+    printf '%s' "${out# }"
 }
 
-set_disk_scheduler_udev_() {
-    local rules_file="/etc/udev/rules.d/60-scheduler.rules"
+record_summary() {
+    local label="$1"
+    local result="$2"
+    local logs="$3"
+    SUMMARY_LABELS+=("$label")
+    SUMMARY_RESULTS+=("$result")
+    SUMMARY_LOGS+=("$logs")
+}
 
-    # Check if running with root privileges
-    if [[ $EUID -ne 0 ]]; then
-        fail "This script must be run as root"
-		return 1
+join_by() {
+    local delimiter="$1"
+    shift || true
+    local first=1
+    local item
+    for item in "$@"; do
+        if [[ "$first" -eq 1 ]]; then
+            printf '%s' "$item"
+            first=0
+        else
+            printf '%s%s' "$delimiter" "$item"
+        fi
+    done
+}
+
+diagnose_failure() {
+    local logfile="$1"
+    local label="${2:-command}"
+    local cause="Unknown. Check the log for the command output."
+
+    if [[ -s "$logfile" ]]; then
+        if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|dpkg was interrupted|you must manually run dpkg --configure -a' "$logfile"; then
+            cause="APT/dpkg is locked or interrupted. Another package operation may be running, or dpkg needs repair."
+        elif grep -Eqi 'Temporary failure resolving|Could not resolve|Name or service not known|Network is unreachable|Connection timed out|Failed to fetch' "$logfile"; then
+            cause="Network, DNS, or package mirror connectivity failed."
+        elif grep -Eqi 'Unable to locate package|Package .* has no installation candidate|E: Version .* was not found' "$logfile"; then
+            cause="A required package is unavailable from the enabled Debian/Ubuntu repositories."
+        elif grep -Eqi 'NO_PUBKEY|The following signatures couldn.t be verified|is not signed|EXPKEYSIG|BADSIG' "$logfile"; then
+            cause="APT repository signature/key verification failed."
+        elif grep -Eqi 'Permission denied|Operation not permitted' "$logfile"; then
+            cause="The command lacked permission, or the host/container blocks that operation."
+        elif grep -Eqi 'Bad return status for module build|DKMS.*build failed|fatal error:|error:' "$logfile"; then
+            cause="The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause."
+        elif grep -Eqi 'No such file or directory|command not found|not found' "$logfile"; then
+            cause="A required command, file, or path was missing."
+        elif grep -Eqi 'Cannot find device|No such device|Device not found' "$logfile"; then
+            cause="The detected network interface is missing or changed name."
+        elif grep -Eqi 'Operation not supported|not supported' "$logfile"; then
+            cause="The kernel, network driver, hypervisor, or container does not support that setting."
+        elif grep -Eqi 'Bad configuration option|unsupported option|Missing privilege separation directory|sshd.*error|line [0-9]+:' "$logfile"; then
+            cause="The generated SSH configuration failed validation."
+        elif grep -Eqi 'Unit .* not found|Failed to start|Job for .* failed|inactive|failed' "$logfile"; then
+            cause="A systemd service failed. Use journalctl for that service for more detail."
+        fi
     fi
 
-    # Check if running in a virtual machine
-    if [ -n "$virt_tech" ]; then
-        info "in virtual machine, skip IO scheduler settings"
+    LAST_FAILURE_CAUSE="$cause"
+    status_failed "${label}"
+    error "Likely cause: ${cause}"
+    error "Relevant log: ${logfile}"
+    if [[ "$VERBOSE" -eq 1 && -s "$logfile" ]]; then
+        warn "Last log lines:"
+        tail -n 8 "$logfile" | sed 's/^/  /' >&2 || true
+    fi
+}
+
+run_cmd() {
+    local label="$1"
+    shift
+    local slug step_log rc command_line
+    slug="$(slugify "$label")"
+    step_log="${LOG_DIR}/${RUN_ID}-${slug}.log"
+    LAST_STEP_LOG="$step_log"
+    CURRENT_ACTION_LOGS+=("$step_log")
+    command_line="$(quote_args "$@")"
+
+    info "START: ${label}"
+    info "  Command: ${command_line}"
+    info "  Log: ${step_log}"
+
+    mkdir -p "$LOG_DIR"
+    chmod 0700 "$LOG_DIR"
+    {
+        printf '%s\n' "### ${label}"
+        printf 'Started: %s\n' "$(date -Is)"
+        printf 'Command: %s\n\n' "$command_line"
+    } > "$step_log"
+    chmod 0600 "$step_log"
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf 'DRY-RUN: command not executed.\n' >> "$step_log"
+        success "DRY-RUN OK: ${label}"
+        return 0
+    fi
+
+    set +e
+    "$@" >> "$step_log" 2>&1
+    rc=$?
+    set -e
+
+    {
+        printf '\nFinished: %s\n' "$(date -Is)"
+        printf 'Exit code: %s\n' "$rc"
+    } >> "$step_log"
+    cat "$step_log" >> "$RUN_LOG" || true
+
+    if [[ "$rc" -eq 0 ]]; then
+        success "OK: ${label}"
+        return 0
+    fi
+
+    diagnose_failure "$step_log" "$label"
+    return "$rc"
+}
+
+run_shell() {
+    local label="$1"
+    local script="$2"
+    run_cmd "$label" bash -Eeuo pipefail -c "$script"
+}
+
+require_root() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        error "This script must be run as root. Try: sudo ./${SCRIPT_NAME} ..."
+        exit 1
+    fi
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+systemd_available() {
+    command_exists systemctl && [[ -d /run/systemd/system ]]
+}
+
+apt_get() {
+    DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Lock::Timeout=120 "$@"
+}
+
+is_package_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+ensure_packages() {
+    local missing=()
+    local pkg
+    for pkg in "$@"; do
+        if ! is_package_installed "$pkg"; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [[ "${#missing[@]}" -eq 0 ]]; then
+        success "Packages already installed: $(join_by ', ' "$@")"
+        return 0
+    fi
+
+    notice "Installing packages: $(join_by ', ' "${missing[@]}")"
+    run_cmd "Update apt package index" apt_get update || return 1
+    run_cmd "Install packages: $(join_by ', ' "${missing[@]}")" apt_get install -y --no-install-recommends "${missing[@]}" || return 1
+}
+
+backup_file() {
+    local file="$1"
+    if [[ -e "$file" ]]; then
+        local backup="${file}.bak.${RUN_ID}"
+        run_cmd "Back up ${file}" cp -a "$file" "$backup" || return 1
+        info "Backup created: ${backup}"
+    fi
+}
+
+write_file() {
+    local path="$1"
+    local mode="$2"
+    local owner_group="${3:-root:root}"
+    local tmp
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY-RUN: would write ${path}"
+        if [[ "$VERBOSE" -eq 1 ]]; then
+            sed 's/^/  | /' "$tmp" || true
+        fi
+        rm -f "$tmp"
+        return 0
+    fi
+    install -o "${owner_group%:*}" -g "${owner_group#*:}" -m "$mode" "$tmp" "$path"
+    rm -f "$tmp"
+}
+
+prompt_yes_no() {
+    local prompt="$1"
+    local default="${2:-n}"
+    local answer
+
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        info "Assuming yes: ${prompt}"
+        return 0
+    fi
+
+    while true; do
+        if [[ "$default" == "y" ]]; then
+            read -r -p "$(tr_text "$prompt") [Y/n]: " answer
+            answer="${answer:-y}"
+        else
+            read -r -p "$(tr_text "$prompt") [y/N]: " answer
+            answer="${answer:-n}"
+        fi
+        case "$answer" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+prompt_int() {
+    local prompt="$1"
+    local min="$2"
+    local max="$3"
+    local __resultvar="$4"
+    local value
+
+    if [[ ! -t 0 ]]; then
+        error "Interactive input is required for: ${prompt}"
         return 1
     fi
 
-    # Create or overwrite the udev rules file
-    cat > "$rules_file" <<EOF
-# Set the scheduler for NVMe SSDs to none
-ACTION=="add|change", KERNEL=="nvme*", RUN+="/bin/sh -c 'echo none > /sys/block/%k/queue/scheduler'"
+    while true; do
+        read -r -p "$(tr_text "$prompt") " value
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= min && value <= max )); then
+            printf -v "$__resultvar" '%s' "$value"
+            return 0
+        fi
+        warn "Enter a number between ${min} and ${max}."
+    done
+}
 
-# Set the scheduler for SATA SSDs to kyber
-ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}=="0", RUN+="/bin/sh -c 'echo kyber > /sys/block/%k/queue/scheduler'"
+validate_iface_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_.:@-]+$ ]]
+}
 
-# Set the scheduler for HDDs to mq-deadline
-ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}=="1", RUN+="/bin/sh -c 'echo mq-deadline > /sys/block/%k/queue/scheduler'"
-EOF
-
-    # Check if the rules file was created successfully
-    if [[ ! -f "$rules_file" ]]; then
-        fail "Failed to create udev rules file: $rules_file"
-		return 1
+detect_system() {
+    if [[ ! -r /etc/os-release ]]; then
+        error "Cannot read /etc/os-release. This script supports Debian and Ubuntu only."
+        exit 1
     fi
 
-    # Reload udev rules
-    udevadm control --reload-rules || fail "Failed to reload udev rules"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-${NAME:-unknown}}"
+    OS_VERSION_ID="${VERSION_ID:-0}"
+    OS_MAJOR="${OS_VERSION_ID%%.*}"
+    [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] || OS_MAJOR=0
 
-    # Trigger udev rules to apply to existing devices
-    udevadm trigger || fail "Failed to trigger udev rules"
+    case "$OS_ID" in
+        debian|ubuntu) ;;
+        *)
+            error "Unsupported OS: ${OS_NAME}. This script intentionally supports only Debian and Ubuntu."
+            exit 1
+            ;;
+    esac
 
-    info "I/O scheduler settings applied via udev rules."
-    return 0
+    if command_exists systemd-detect-virt; then
+        VIRT_TECH="$(systemd-detect-virt 2>/dev/null || true)"
+        [[ -n "$VIRT_TECH" ]] || VIRT_TECH="none"
+        if systemd-detect-virt --container >/dev/null 2>&1; then
+            VIRT_KIND="container"
+        elif systemd-detect-virt --vm >/dev/null 2>&1; then
+            VIRT_KIND="vm"
+        else
+            VIRT_KIND="none"
+        fi
+    fi
+
+    if command_exists ip; then
+        PRIMARY_IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' | cut -d'@' -f1)"
+        if [[ -z "$PRIMARY_IFACE" ]]; then
+            PRIMARY_IFACE="$(ip -o link show up 2>/dev/null | awk -F': ' '$2 != "lo" {gsub(/@.*/, "", $2); print $2; exit}')"
+        fi
+        if [[ -n "$PRIMARY_IFACE" ]] && ! validate_iface_name "$PRIMARY_IFACE"; then
+            warn "Detected interface has unexpected characters and will not be used: ${PRIMARY_IFACE}"
+            PRIMARY_IFACE=""
+        fi
+    else
+        warn "ip command not found. Network-interface actions will fail until iproute2 is installed."
+        PRIMARY_IFACE=""
+    fi
+
+    if systemd_available; then
+        if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+            SSH_SERVICE="ssh.service"
+        elif systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+            SSH_SERVICE="sshd.service"
+        else
+            SSH_SERVICE="ssh.service"
+        fi
+    else
+        SSH_SERVICE="ssh"
+    fi
+
+    info "Detected system: ${OS_NAME} (${OS_ID} ${OS_VERSION_ID}), virtualization: ${VIRT_TECH}, primary interface: ${PRIMARY_IFACE:-unknown}"
+}
+
+require_systemd() {
+    if ! systemd_available; then
+        error "This action requires systemd. The current environment does not appear to be booted with systemd."
+        return 1
+    fi
+}
+
+service_logs_hint() {
+    local unit="$1"
+    info "To diagnose ${unit}: journalctl -u ${unit} --no-pager -n 120"
 }
 
 
-#TCP Queue Length
-set_txqueuelen_() {
-	if [ -z $(which net-tools) ]; then
-		if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-			apt-get install net-tools -y
-			if [ $? -ne 0 ]; then
-				fail "Net-tools Installation Failed"
-				return 1
-			fi
-		elif [[ $os =~ "CentOS" ]] || [[ $os =~ "Redhat" ]]; then
-			yum install net-tools -y
-			if [ $? -ne 0 ]; then
-				fail "Net-tools Installation Failed"
-				return 1
-			fi
-		fi
-	fi
-    ifconfig $nic txqueuelen 10000
-    sleep 1
-	return 0
-}
-set_initial_congestion_window_() {
-	info "Setting initial congestion window for the primary default route..."
-	
-	local primary_route
-	primary_route=$(ip -o -4 route show default scope global | head -n1)
-	[ -z "$primary_route" ] && primary_route=$(ip -o -4 route show to default | head -n1)
-	
-	if [ -z "$primary_route" ]; then
-		fail "No default route found"
-		return 1
-	fi
-	info "Found primary default route: $primary_route"
-	
-	# 解析路由信息
-	local gateway device proto src metric
-	gateway=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); break}}')
-	device=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); break}}')
-	proto=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="proto") {print $(i+1); break}}')
-	src=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); break}}')
-	metric=$(echo "$primary_route" | awk '{for(i=1;i<=NF;i++) if($i=="metric") {print $(i+1); break}}')
-	
-	# 验证必要参数
-	if [ -z "$device" ]; then
-		fail "Could not parse device from route: '$primary_route'"
-		return 1
-	fi
-	
-	# 验证网络接口是否存在
-	if ! ip link show "$device" >/dev/null 2>&1; then
-		fail "Network device '$device' does not exist or is not available"
-		return 1
-	fi
-	
-	# 检查接口状态
-	local interface_state
-	interface_state=$(ip link show "$device" | grep -o "state [A-Z]*" | awk '{print $2}')
-	if [ "$interface_state" != "UP" ]; then
-		warn "Interface '$device' is not UP (current state: $interface_state), attempting to bring it up..."
-		ip link set "$device" up
-		sleep 2
-		interface_state=$(ip link show "$device" | grep -o "state [A-Z]*" | awk '{print $2}')
-		if [ "$interface_state" != "UP" ]; then
-			fail "Failed to bring interface '$device' up (current state: $interface_state)"
-			return 1
-		fi
-	fi
-	
-	# 构建路由修改命令
-	local route_cmd="ip route change default dev $device"
-	
-	# 添加可选参数
-	[ -n "$gateway" ] && route_cmd="$route_cmd via $gateway"
-	[ -n "$proto" ] && route_cmd="$route_cmd proto $proto"
-	[ -n "$src" ] && route_cmd="$route_cmd src $src"
-	[ -n "$metric" ] && route_cmd="$route_cmd metric $metric"
-	
-	# 添加拥塞窗口参数
-	route_cmd="$route_cmd initcwnd 100 initrwnd 100"
-	
-	info "Executing: $route_cmd"
-	
-	# 执行路由修改命令
-	if eval "$route_cmd" 2>/dev/null; then
-		info "Successfully set initial congestion window."
-		return 0
-	else
-		# 如果失败，尝试简化版本
-		warn "Full route modification failed, trying simplified version..."
-		local simple_cmd="ip route change default dev $device initcwnd 100 initrwnd 100"
-		[ -n "$gateway" ] && simple_cmd="ip route change default via $gateway dev $device initcwnd 100 initrwnd 100"
-		
-		info "Trying simplified command: $simple_cmd"
-		if eval "$simple_cmd" 2>/dev/null; then
-			info "Successfully set initial congestion window with simplified command."
-			return 0
-		else
-			# 最后尝试：先删除再添加
-			warn "Simplified command failed, trying delete and add approach..."
-			ip route del default 2>/dev/null
-			sleep 1
-			if eval "$simple_cmd" 2>/dev/null; then
-				info "Successfully set initial congestion window after route recreation."
-				return 0
-			else
-				fail "Failed to set initial congestion window. Last error: $(eval "$simple_cmd" 2>&1)"
-				return 1
-			fi
-		fi
-	fi
-}
-#Kernel Settings
-kernel_settings_() {
-	# Set variables based on memory size
-	if [ $mem_size -le 128 ]; then	# 128MB or less
-		adv_win_scale=3
-		rmem_default=262144
-		rmem_max=16777216
-		tcp_rmem="8192 $rmem_default $rmem_max"
-		wmem_default=262144
-		wmem_max=16777216
-		tcp_wmem="8192 $wmem_default $wmem_max"
-		background_ratio=5
-		dirty_ratio=20
-		writeback_centisecs=100
-		expire_centisecs=100
-		swappiness=80
-	elif [ $mem_size -le 512 ]; then	# 512MB or less
-		adv_win_scale=2
-		rmem_default=262144
-		rmem_max=16777216
-		tcp_rmem="8192 $rmem_default $rmem_max"
-		wmem_default=262144
-		wmem_max=16777216
-		tcp_wmem="8192 $wmem_default $wmem_max"
-		background_ratio=5
-		dirty_ratio=20
-		writeback_centisecs=100
-		expire_centisecs=500
-		swappiness=60
-	elif [ $mem_size -le 1024 ]; then	# 1GB or less
-		adv_win_scale=1
-		rmem_default=262144
-		rmem_max=33554432
-		tcp_rmem="8192 $rmem_default $rmem_max"
-		wmem_default=262144
-		wmem_max=33554432
-		tcp_wmem="8192 $wmem_default $wmem_max"
-		background_ratio=5
-		dirty_ratio=30
-		writeback_centisecs=100
-		expire_centisecs=1000
-		swappiness=20
-	else	# 1GB or more
-		adv_win_scale=1
-		rmem_default=262144
-		rmem_max=33554432
-		tcp_rmem="8192 $rmem_default $rmem_max"
-		wmem_default=262144
-		wmem_max=33554432
-		tcp_wmem="8192 $wmem_default $wmem_max"
-		background_ratio=5
-		dirty_ratio=30
-		writeback_centisecs=100
-		expire_centisecs=1000
-		swappiness=10
-	fi
-	
-	cat << EOF > /etc/sysctl.conf
-#### Network Security Settings
-# Turn on Source Address Verification in all interfaces to prevent some spoofing attacks
-net.ipv4.conf.default.rp_filter=1
-net.ipv4.conf.all.rp_filter=1
-
-# Protect a server against SYN flood attacks
-#Enable TCP/IP SYN cookies to 
-net.ipv4.tcp_syncookies=1
-#Increase the maximum queue length of completely established sockets waiting to be accepted
-# The net.core.somaxconn parameter is the maximum queue length of completely established sockets waiting to be accepted.
-net.core.somaxconn=10000
-#Increase the maximum queue length of incomplete sockets i.e. half-open connection
-# The net.ipv4.tcp_max_syn_backlog parameter is the maximum queue length of incomplete sockets.
-# NOTE: THis value should not be above "net.core.somaxconn", since that is also a hard open limit of maximum queue length of incomplete sockets/
-# Kernel will take the lower one out of two as the maximum queue length of incomplete sockets
-net.ipv4.tcp_max_syn_backlog=10000
-#Increase the maximal number of TCP sockets not attached to any user file handle (i.e. orphaned connections), held by system.
-# NOTE: each orphan eats up to ~64K of unswappable memory
-# The net.ipv4.tcp_max_orphans parameter is the maximum number of TCP sockets not attached to any user file handle.
-net.ipv4.tcp_max_orphans=10000
-#Quickly Discard locally closed TCP connection
-net.ipv4.tcp_orphan_retries = 2
-
-# Protect a server against ack loop" DoS attacks
-net.ipv4.tcp_invalid_ratelimit=500
-
-# Disable packet forwarding
-net.ipv4.ip_forward=0
-net.ipv6.conf.all.forwarding=0
-
-# Do not accept ICMP redirects (prevent MITM attacks)
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-
-# Do not send ICMP redirects (we are not a router)
-net.ipv4.conf.all.send_redirects = 0
-
-# Do not accept IP source route packets (we are not a router)
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv6.conf.all.accept_source_route = 0
-
-# Log Martian Packets
-net.ipv4.conf.all.log_martians = 1
-
-# Protect Against TCP TIME-WAIT Assassination
-net.ipv4.tcp_rfc1337 = 0
-
-
-### SoftIRQ Misses
-# SoftIRQs are used for tasks that are not time-critical, such as network packet processing.
-# Check the number of softIRQ misses
-# cat /proc/net/softnet_stat
-# Pay close attention to the following columns:
-# Column-01: packet_process: Packet processed by each CPU.
-# Column-02: packet_drop: Packets dropped.
-# Column-03: time_squeeze: net_rx_action.
-
-# Column-02: packet_drop: Packets dropped.
-# Packet_drop indicates that the NIC is dropping packets due to a lack of backlog space.
-# Solution 1. : Increase the size of the NIC's backlog
-# The backlog is the number of packets that the NIC can store in its backlog queue.
-# Increase the backlog size to 10000
-net.core.netdev_max_backlog=10000
-
-# Column-03: time_squeeze: net_rx_action
-# Time_squeeze: net_rx_action counter indicates the number of times the CPU has to return prematurely without draining the queue.
-# This is most likely weak causing by weak CPU in a high-traffic environment.
-# Solution 2. : Increasing net.core.netdev_budget and net.core.netdev_budget_usecs
-# The netdev_budget parameter is the maximum number of packets that the kernel will process in a single softIRQ.
-# The netdev_budget_usecs parameter is the maximum amount of time that the kernel will spend processing packets in a single softIRQ.
-# To increase the netdev_budget and netdev_budget_usecs values, you can use the sysctl command.
-net.core.netdev_budget=50000
-net.core.netdev_budget_usecs=8000
-# NOTE: Setting a high number might cause CPU to stall and end in poor overall performance
-# NOTE: Increasing the number of Query Channels (RSS) can also help with the issue.
-
-# Low latency busy poll timeout for socket reads
-# NOTE: Not supported by most NIC
-#net.core.busy_read=50
-# Low latency busy poll timeout for poll and select
-# NOTE: Not supported by most NIC
-#net.core.busy_poll=50
-
-
-### Socket buffer size
-#Congestion window
-# The congestion window is the amount of data that the sender can send before it must wait for an acknowledgment from the receiver.
-# The congestion window is limited by 2 things. 
-#   The receiver's advertised window size, which is the amount of data that the receiver is willing to accept
-#   And also the size of the sending socket buffer on the sender's end.
-
-#How to determine the optimal congestion window
-# The optimal congestion window size is determined by the bandwidth-delay product (BDP) of the network.
-# The BDP is the amount of data that can be in transit in the network at any given time.
-# It is calculated by multiplying the bandwidth of the network by the round-trip time (RTT) of the network.
-# The optimal congestion window size is the BDP of the network.
-# You can use this site to calculate the BDP of your network: https://www.speedguide.net/bdp.php
-
-#How to determine the Optimal Receive socket Buffer Size
-# The optimal socket buffer size is determined by optimal congestion window and, in turn, also determined by the bandwidth-delay product (BDP) of the network.
-# We have to make sure the advertised window size is not smaller than BDP to prevent underutilization of the network.
-# The receive socket buffer space is shared between the application and kernel. /
-#   TCP maintains part of the buffer as the TCP window, this is the size of the receive window advertised to the other end.  /
-#   The rest of the space is used as the "application" buffer, used to isolate the network from scheduling and application latencies.
-# The total receive socket buffer space is determined by net.ipv4.tcp_rmem and the portion of which is allocated as "application" buffer is determined by net.ipv4.tcp_adv_win_scale.
-net.ipv4.tcp_adv_win_scale=$adv_win_scale
-net.core.rmem_default=$rmem_default
-net.core.rmem_max=$rmem_max
-net.ipv4.tcp_rmem=$tcp_rmem
-
-#How to determine the Optimal Send socket Buffer Size
-# Send socket buffer size determine the maximum amount of data that the application can send before needing to wait for an acknowledgment (ACK) from the receiver
-# As you may have recalled, it is bascially the definition of congestion window
-# Therefore it is important to make sure the send buffer space is not smaller than BDP to prevent underutilization of the network.
-
-# You can set send socket buffer size using the sysctl command.
-net.core.wmem_default=$wmem_default
-net.core.wmem_max=$wmem_max
-net.ipv4.tcp_wmem=$tcp_wmem
-
-#Relationship between net.core.r/wmem and net.ipv4.tcp_r/wmem
-# net.core.r/wmem is the default buffer size for all protocols, including TCP
-# And net.ipv4.tcp_r/wmem is the buffer size for TCP only
-
-#net.ipv4.tcp_rmem = tcp_rmem_min tcp_rmem_default tcp_rmem_max
-# Vector of 3 INTEGERs: min, default, max
-#	min: Minimal size of receive buffer used by TCP sockets.
-#	It is guaranteed to each TCP socket, even under moderate memory
-#	pressure.
-#
-#	default: initial size of receive buffer used by TCP sockets.
-#	This value overrides net.core.rmem_default used by other protocols.
-#
-#	max: maximal size of receive buffer allowed for automatically
-#	selected receiver buffers for TCP socket. This value does not override
-#	net.core.rmem_max.  Calling setsockopt() with SO_RCVBUF disables
-#	automatic tuning of that socket's receive buffer size, in which
-#	case this value is ignored.
-
-#net.ipv4.tcp_wmem = tcp_wmem_min tcp_wmem_default tcp_wmem_max
-# Vector of 3 INTEGERs: min, default, max
-#	min: Amount of memory reserved for send buffers for TCP sockets.
-#	Each TCP socket has rights to use it due to fact of its birth.
-#
-#	default: initial size of send buffer used by TCP sockets.  This
-#	value overrides net.core.wmem_default used by other protocols.
-#	It is usually lower than net.core.wmem_default.
-#
-#	max: Maximal amount of memory allowed for automatically tuned
-#	send buffers for TCP sockets. This value does not override
-#	net.core.wmem_max.  Calling setsockopt() with SO_SNDBUF disables
-#	automatic tuning of that socket's send buffer size, in which case
-#	this value is ignored.
-
-# Because of the varying internet condition, not every connection is going to reach the optimal congestion window size, and that's okay.
-# To prevent slow link from using more than necessary amount of memory, we can use the following sysctl settings to enable receive buffer auto-tuning
-net.ipv4.tcp_moderate_rcvbuf = 1
-
-
-# Allows the use of a large window (> 64 kB) on a TCP connection, this is the default settings for most modern kernel
-net.ipv4.tcp_window_scaling = 1
-
-# Set maximum window size to MAX_TCP_WINDOW i.e. 32767 in times there is no received window scaling option
-net.ipv4.tcp_workaround_signed_windows = 1
-
-
-### MTU Discovery
-# Allow Path MTU Discovery
-net.ipv4.ip_no_pmtu_disc = 0
-
-# Enable TCP Packetization-Layer Path, and use initial MSS of tcp_base_mss
-net.ipv4.tcp_mtu_probing = 2
-
-# Starting MSS used in Path MTU discovery
-net.ipv4.tcp_base_mss = 1460
-
-#  Minimum MSS used in connection, cap it to this value even if advertised ADVMSS option is even lower
-net.ipv4.tcp_min_snd_mss = 536
-
-# Maximum memory used to reassemble IP fragments
-net.ipv4.ipfrag_high_thresh = 8388608
-
-
-### Account for a high RTT lossy network
-# Enable selective acknowledgments 
-net.ipv4.tcp_sack = 1
-
-# Allows TCP to send "duplicate" SACKs
-net.ipv4.tcp_dsack = 1
-
-# Enable Early Retransmit. ER lowers the threshold for triggering fast retransmit when the amount of outstanding data is small and when no previously unsent data can be transmitted
-net.ipv4.tcp_early_retrans = 3
-
-# Disable ECN to survive in a congested network
-net.ipv4.tcp_ecn = 0
-
-# Reordering level of packets in a TCP stream
-# Initial reordering level of packets in a TCP stream. TCP stack can then dynamically adjust flow reordering level between this initial value and tcp_max_reordering
-net.ipv4.tcp_reordering = 10
-# Maximal reordering level of packets in a TCP stream
-net.ipv4.tcp_max_reordering = 1000
-# NOTE: An attempt to reduce the number of retransmissions due to packet reordering in a network. Which is common in a lossy network
-
-# Enable F-RTO (Forward RTO-Recovery). Beneficial in networks where the RTT fluctuates 
-net.ipv4.tcp_frto = 2
-
-# Enable TCP Auto Corking
-# When enabled, the TCP stack will automatically cork the socket when the application is not sending data fast enough
-net.ipv4.tcp_autocorking = 1
-
-# TCP Retry
-# The number of times to retry before killing an alive TCP connection
-net.ipv4.tcp_retries1 = 5
-net.ipv4.tcp_retries2 = 20
-
-# TCP Keepalive
-# After $tcp_keepalive_time seconds of inactivity, TCP will send a keepalive probe every $tcp_keepalive_intvl to the other end. /
-# After $tcp_keepalive_probes failed attempts, the connection will be closed
-# In seconds, time default value for connections to keep alive
-net.ipv4.tcp_keepalive_time = 7200
-# In seconds, how frequently the probes are send out
-net.ipv4.tcp_keepalive_intvl = 120
-# How many keepalive probes TCP sends out, until it decides that the connection is broken
-net.ipv4.tcp_keepalive_probes = 15
-
-# SYN 
-# Number of times SYNACKs for a passive TCP connection attempt will be retransmitted
-net.ipv4.tcp_synack_retries = 10
-# Number of times initial SYNs for an active TCP connection attempt	will be retransmitted
-net.ipv4.tcp_syn_retries = 7
-
-
-### To support more connections
-#Solution 1. : Increase the maximum number of file descriptors
-# The maximum number of connections that a server can handle is determined by the maximum number of file descriptors that the server can open.
-#fs.file-max=655360
-#fs.nr_open=655360
-
-#Solution 2. : Increase the number of port that the kernel can allocate for outgoing connections
-# The net.ipv4.ip_local_port_range parameter is the range of port numbers that the kernel can allocate for outgoing connections.
-net.ipv4.ip_local_port_range=1024 65535
-
-#Solution 3. : Increase the maximum number of sockets in TIME_WAIT state
-# The net.ipv4.tcp_max_tw_buckets parameter is the maximum number of sockets in TIME_WAIT state.
-net.ipv4.tcp_max_tw_buckets=10000
-
-#Solution 4. : Quickly discard sockets in the state FIN-WAIT-2
-# The net.ipv4.tcp_fin_timeout parameter is the maximum time that a connection in the FIN-WAIT-2 state will stay open.
-net.ipv4.tcp_fin_timeout=10
-
-
-### Miscellaneous
-# Enable TCP Fast Open
-# TCP Fast Open (TFO) is an extension to speed up the opening of successive TCP connections between two endpoints
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
-
-# The maximum amount of unsent bytes in TCP socket write queue, this is on top of the congestion window
-net.ipv4.tcp_notsent_lowat = 131072
-
-# Avoid falling back to slow start after a connection goes idle
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# Disable timestamps
-net.ipv4.tcp_timestamps = 0
-
-# Save cache metrics on closing connections
-net.ipv4.tcp_no_metrics_save = 0
-
-## ARP table settings
-# The maximum number of bytes which may be used by packets queued for each unresolved address by other network layers
-net.ipv4.neigh.default.unres_qlen_bytes = 16777216
-
-# Controls a per TCP socket cache of one socket buffer
-# net.ipv4.tcp_rx_skb_cache=1
-
-
-### Buffer and cache management
-# Percentage of total system memory that can be filled with dirty pages /
-# before the system starts writing them to disk in the background
-vm.dirty_background_ratio = $background_ratio
-# Percentage of total system memory that can be filled with dirty pages 
-# before the system blocks any further writes /
-# and forces the process that is generating dirty pages to write them to disk.
-vm.dirty_ratio = $dirty_ratio
-
-# The interval of when writes of dirty in-memory data are written out to disk. 
-# It is expressed in centiseconds
-vm.dirty_writeback_centisecs = $writeback_centisecs
-# when dirty in-memory data is old enough to be eligible for writeout by the kernel flusher threads. 
-# It is also expressed in centiseconds. 
-vm.dirty_expire_centisecs = $expire_centisecs
-
-# Avoid using swap as much as possible
-vm.swappiness = $swappiness
-
-
-### Congestion Control
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-	sysctl -p
-	return 0
-}
-tune_() {
-	tuned_
-	set_file_open_limit_
-	kernel_settings_
-
-	if [ -z "$virt_tech" ]; then		#If not a virtual machine
-		set_ring_buffer_
-	else
-		disable_tso_
-	fi
-
-	if [ -z "$virt_tech" ] || [ "$virt_tech" != "lxc" ]; then		#If not a LXC container
-		set_txqueuelen_
-		set_initial_congestion_window_
-	fi
-
-	boot_script_
-	return 0
+wait_for_fail2ban() {
+    local attempts="${1:-30}"
+    local delay="${2:-1}"
+    local i
+
+    for ((i=1; i<=attempts; i++)); do
+        if fail2ban-client ping >/dev/null 2>&1; then
+            fail2ban-client ping
+            return 0
+        fi
+        sleep "$delay"
+    done
+
+    fail2ban-client ping
 }
 
-## Configue Boot Script
-boot_script_() {
-	mkdir -p /root/.tune
-	cp -f "${BASH_SOURCE[0]}" /root/.tune/tune.sh 2>/dev/null || cp -f "$0" /root/.tune/tune.sh 2>/dev/null
-	
-	touch /root/.boot-script.sh && chmod +x /root/.boot-script.sh
-	cat << 'EOF' > /root/.boot-script.sh
-#!/bin/bash
+reload_systemd() {
+    require_systemd || return 1
+    run_cmd "Reload systemd unit files" systemctl daemon-reload
+}
 
-# network connection check
-echo "Waiting for network connection..."
-# try up to 60 times, 5 seconds apart
-for i in {1..60}; do
-	if ping -c 1 -W 1 8.8.8.8 &> /dev/null || ping -c 1 -W 1 114.114.114.114 &> /dev/null; then
-		echo "Network connected, continue..."
-		break
-	fi
-	
-	if [ $i -eq 60 ]; then
-		echo "Network connection timeout, continue..."
-	else
-		echo "Waiting for network connection, try $i/60..."
-		sleep 5
-	fi
+enable_start_service() {
+    local unit="$1"
+    reload_systemd || return 1
+    run_cmd "Enable and start ${unit}" systemctl enable --now "$unit" || {
+        service_logs_hint "$unit"
+        return 1
+    }
+    run_cmd "Check ${unit} is active" systemctl is-active --quiet "$unit" || {
+        service_logs_hint "$unit"
+        return 1
+    }
+}
+
+install_linux_sysctl_defaults_if_needed() {
+    if [[ "$OS_ID" == "debian" && "$OS_MAJOR" -ge 13 ]]; then
+        ensure_packages linux-sysctl-defaults || {
+            warn "linux-sysctl-defaults could not be installed. Continuing, but Debian 13 defaults may be incomplete."
+            return 0
+        }
+    fi
+}
+
+configure_auto_updates() {
+    separator
+    info "Configuring unattended security updates"
+    ensure_packages unattended-upgrades apt-listchanges || return 1
+
+    run_shell "Enable unattended-upgrades with debconf" \
+        "printf '%s\n' 'unattended-upgrades unattended-upgrades/enable_auto_updates boolean true' | debconf-set-selections && dpkg-reconfigure -f noninteractive unattended-upgrades" || return 1
+
+    write_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF_AUTO'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF_AUTO
+    success "Wrote /etc/apt/apt.conf.d/20auto-upgrades"
+
+    if systemd_available; then
+        run_cmd "Enable apt daily timers" systemctl enable --now apt-daily.timer apt-daily-upgrade.timer || return 1
+    fi
+}
+
+write_bandwidth_guard_script() {
+    write_file "${BIN_DIR}/tune-bandwidth-guard" 0755 <<'EOF_BW_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CONFIG_FILE="/etc/tune/bandwidth-guard.env"
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+: "${INTERFACE:?missing INTERFACE}"
+: "${MONTHLY_UPLOAD_LIMIT_GIB:?missing MONTHLY_UPLOAD_LIMIT_GIB}"
+: "${MONTHLY_DOWNLOAD_LIMIT_GIB:?missing MONTHLY_DOWNLOAD_LIMIT_GIB}"
+: "${RESET_DAY:?missing RESET_DAY}"
+CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-60}"
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-bandwidth-guard -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+last_day_of_month() {
+    date -d "$1 +1 month -1 day" +%d
+}
+
+anchor_for_month() {
+    local month_start="$1"
+    local year month last day
+    year="$(date -d "$month_start" +%Y)"
+    month="$(date -d "$month_start" +%m)"
+    last="$(last_day_of_month "${year}-${month}-01")"
+    day="$RESET_DAY"
+    (( day > 10#$last )) && day="$last"
+    printf '%04d-%02d-%02d\n' "$year" "10#$month" "$day"
+}
+
+period_bounds() {
+    local today month_start current_anchor prev_month next_month begin end
+    today="$(date +%Y-%m-%d)"
+    month_start="$(date +%Y-%m-01)"
+    current_anchor="$(anchor_for_month "$month_start")"
+    if [[ "$today" > "$current_anchor" || "$today" == "$current_anchor" ]]; then
+        begin="$current_anchor"
+        next_month="$(date -d "$month_start +1 month" +%Y-%m-01)"
+        end="$(anchor_for_month "$next_month")"
+    else
+        prev_month="$(date -d "$month_start -1 month" +%Y-%m-01)"
+        begin="$(anchor_for_month "$prev_month")"
+        end="$current_anchor"
+    fi
+    printf '%s %s\n' "$begin" "$end"
+}
+
+to_gib() {
+    local value="$1"
+    local unit="$2"
+    awk -v value="$value" -v unit="$unit" 'BEGIN {
+        if (unit == "B")   printf "%.6f", value / 1073741824;
+        else if (unit == "KiB") printf "%.6f", value / 1048576;
+        else if (unit == "MiB") printf "%.6f", value / 1024;
+        else if (unit == "GiB") printf "%.6f", value;
+        else if (unit == "TiB") printf "%.6f", value * 1024;
+        else exit 2;
+    }'
+}
+
+ge_float() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+while true; do
+    read -r begin_date end_date < <(period_bounds)
+    if ! line="$(vnstat --begin "$begin_date" --end "$end_date" -i "$INTERFACE" --oneline 2>&1)"; then
+        log_msg warning "vnStat query failed for ${INTERFACE}: ${line}"
+        sleep "$CHECK_INTERVAL_SECONDS"
+        continue
+    fi
+
+    upload="$(awk -F';' '{print $10}' <<<"$line")"
+    download="$(awk -F';' '{print $9}' <<<"$line")"
+    upload_value="$(awk '{print $1}' <<<"$upload")"
+    upload_unit="$(awk '{print $2}' <<<"$upload")"
+    download_value="$(awk '{print $1}' <<<"$download")"
+    download_unit="$(awk '{print $2}' <<<"$download")"
+
+    if ! upload_gib="$(to_gib "$upload_value" "$upload_unit")"; then
+        log_msg warning "Unknown upload unit from vnStat: ${upload_unit:-empty}"
+        sleep "$CHECK_INTERVAL_SECONDS"
+        continue
+    fi
+    if ! download_gib="$(to_gib "$download_value" "$download_unit")"; then
+        log_msg warning "Unknown download unit from vnStat: ${download_unit:-empty}"
+        sleep "$CHECK_INTERVAL_SECONDS"
+        continue
+    fi
+
+    if ge_float "$upload_gib" "$MONTHLY_UPLOAD_LIMIT_GIB"; then
+        log_msg crit "Monthly upload limit exceeded: ${upload_gib} GiB >= ${MONTHLY_UPLOAD_LIMIT_GIB} GiB. Shutting down."
+        shutdown -h now "Monthly upload bandwidth limit exceeded"
+    fi
+    if ge_float "$download_gib" "$MONTHLY_DOWNLOAD_LIMIT_GIB"; then
+        log_msg crit "Monthly download limit exceeded: ${download_gib} GiB >= ${MONTHLY_DOWNLOAD_LIMIT_GIB} GiB. Shutting down."
+        shutdown -h now "Monthly download bandwidth limit exceeded"
+    fi
+
+    sleep "$CHECK_INTERVAL_SECONDS"
 done
+EOF_BW_SCRIPT
+}
 
-# Source tune functions
-if [ -f /root/.tune/tune.sh ]; then
-	source /root/.tune/tune.sh
-else
-	echo "tune script not found at /root/.tune/tune.sh"
-	exit 1
-fi
+configure_bandwidth_limit() {
+    separator
+    info "Configuring monthly bandwidth shutdown guard"
 
-# Initialize system info
-sysinfo_
+    local upload_limit download_limit reset_day
+    prompt_int "Monthly upload limit in GiB:" 1 100000000 upload_limit || return 1
+    prompt_int "Monthly download limit in GiB:" 1 100000000 download_limit || return 1
+    prompt_int "Bandwidth reset day of month (1-31):" 1 31 reset_day || return 1
 
-# Apply settings based on virtualization
-if [ -z "$virt_tech" ]; then
-	set_ring_buffer_
-else
-	disable_tso_
-fi
+    if [[ -z "$PRIMARY_IFACE" ]]; then
+        error "No primary network interface detected."
+        return 1
+    fi
 
-if [ -z "$virt_tech" ] || [ "$virt_tech" != "lxc" ]; then
-	set_txqueuelen_
-	set_initial_congestion_window_
-fi
-EOF
+    ensure_packages vnstat || return 1
+    require_systemd || return 1
+    mkdir -p "$CONFIG_DIR" "$BIN_DIR"
 
-	cat << EOF > /etc/systemd/system/boot-script.service
+    if systemctl list-unit-files vnstat.service >/dev/null 2>&1; then
+        run_cmd "Enable vnStat service" systemctl enable --now vnstat.service || return 1
+    fi
+    run_shell "Initialize vnStat database for ${PRIMARY_IFACE}" "vnstat --add -i '$PRIMARY_IFACE' >/dev/null 2>&1 || true" || return 1
+
+    write_file "${CONFIG_DIR}/bandwidth-guard.env" 0600 <<EOF_BW_ENV
+INTERFACE="${PRIMARY_IFACE}"
+MONTHLY_UPLOAD_LIMIT_GIB="${upload_limit}"
+MONTHLY_DOWNLOAD_LIMIT_GIB="${download_limit}"
+RESET_DAY="${reset_day}"
+CHECK_INTERVAL_SECONDS="60"
+EOF_BW_ENV
+    success "Wrote ${CONFIG_DIR}/bandwidth-guard.env"
+
+    write_bandwidth_guard_script
+    success "Installed ${BIN_DIR}/tune-bandwidth-guard"
+
+    write_file /etc/systemd/system/tune-bandwidth-guard.service 0644 <<'EOF_BW_UNIT'
 [Unit]
-Description=System Network Optimization Script
-After=network.target network-online.target
+Description=Tune Bandwidth Shutdown Guard
+After=network-online.target vnstat.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/root/.boot-script.sh
+ExecStart=/usr/local/sbin/tune-bandwidth-guard
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
-EOF
-	systemctl daemon-reload
-	systemctl enable boot-script.service
-	return 0
+EOF_BW_UNIT
+    enable_start_service tune-bandwidth-guard.service || return 1
+    service_logs_hint tune-bandwidth-guard.service
 }
 
+write_cpu_guard_script() {
+    write_file "${BIN_DIR}/tune-cpu-guard" 0755 <<'EOF_CPU_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-## BBR
-install_bbrx_() {
-	if [[ "$os" =~ "Debian" ]]; then
-		if [ $(uname -m) == "x86_64" ]; then
-			apt-get -y install linux-image-amd64 linux-headers-amd64
-			if [ $? -ne 0 ]; then
-				fail "BBR installation failed"
-				return 1
-			fi
-		elif [ $(uname -m) == "aarch64" ]; then
-			apt-get -y install linux-image-arm64 linux-headers-arm64
-			if [ $? -ne 0 ]; then
-				fail "BBR installation failed"
-				return 1
-			fi
-		fi
-	elif [[ "$os" =~ "Ubuntu" ]]; then
-		apt-get -y install linux-image-generic linux-headers-generic
-		if [ $? -ne 0 ]; then
-			fail "BBR installation failed"
-			return 1
-		fi
-	else
-		fail "Unsupported OS"
-		return 1
-	fi
-	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRx.sh -O /root/BBRx.sh && chmod +x /root/BBRx.sh
-	# Check if download fail
-	if [ ! -f BBRx.sh ]; then
-		fail "BBR download failed"
-		return 1
-	fi
-    ## Install tweaked BBR automatically on reboot
-    cat << EOF > /etc/systemd/system/bbrinstall.service
+CONFIG_FILE="/etc/tune/cpu-guard.env"
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+: "${CPU_LIMIT_PERCENT:?missing CPU_LIMIT_PERCENT}"
+SAMPLE_INTERVAL_SECONDS="${SAMPLE_INTERVAL_SECONDS:-10}"
+REQUIRED_SAMPLES="${REQUIRED_SAMPLES:-180}"
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-cpu-guard -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+read_cpu_totals() {
+    awk '/^cpu / {
+        idle=$5
+        total=0
+        for (i=2; i<=NF; i++) total += $i
+        print idle, total
+    }' /proc/stat
+}
+
+ge_float() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+read -r prev_idle prev_total < <(read_cpu_totals)
+excess_samples=0
+
+while true; do
+    sleep "$SAMPLE_INTERVAL_SECONDS"
+    read -r idle total < <(read_cpu_totals)
+    delta_idle=$((idle - prev_idle))
+    delta_total=$((total - prev_total))
+    prev_idle="$idle"
+    prev_total="$total"
+
+    if (( delta_total <= 0 )); then
+        continue
+    fi
+
+    usage="$(awk -v di="$delta_idle" -v dt="$delta_total" 'BEGIN { printf "%.2f", (1 - di / dt) * 100 }')"
+    if ge_float "$usage" "$CPU_LIMIT_PERCENT"; then
+        excess_samples=$((excess_samples + 1))
+    else
+        excess_samples=0
+    fi
+
+    if (( excess_samples >= REQUIRED_SAMPLES )); then
+        log_msg crit "CPU usage stayed above ${CPU_LIMIT_PERCENT}% for $((SAMPLE_INTERVAL_SECONDS * REQUIRED_SAMPLES)) seconds. Shutting down. Last usage: ${usage}%."
+        shutdown -h now "Sustained CPU usage limit exceeded"
+    fi
+done
+EOF_CPU_SCRIPT
+}
+
+configure_cpu_shutdown() {
+    separator
+    info "Configuring sustained high-CPU shutdown guard"
+
+    local cpu_limit
+    prompt_int "CPU usage threshold percent (1-100):" 1 100 cpu_limit || return 1
+    require_systemd || return 1
+    mkdir -p "$CONFIG_DIR" "$BIN_DIR"
+
+    write_file "${CONFIG_DIR}/cpu-guard.env" 0600 <<EOF_CPU_ENV
+CPU_LIMIT_PERCENT="${cpu_limit}"
+SAMPLE_INTERVAL_SECONDS="10"
+REQUIRED_SAMPLES="180"
+EOF_CPU_ENV
+    success "Wrote ${CONFIG_DIR}/cpu-guard.env"
+
+    write_cpu_guard_script
+    success "Installed ${BIN_DIR}/tune-cpu-guard"
+
+    write_file /etc/systemd/system/tune-cpu-guard.service 0644 <<'EOF_CPU_UNIT'
 [Unit]
-Description=BBRinstall
-After=network.target network-online.target
+Description=Tune Sustained CPU Shutdown Guard
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tune-cpu-guard
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF_CPU_UNIT
+    enable_start_service tune-cpu-guard.service || return 1
+    service_logs_hint tune-cpu-guard.service
+}
+
+write_ddos_guard_script() {
+    write_file "${BIN_DIR}/tune-ddos-guard" 0755 <<'EOF_DDOS_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+CONFIG_FILE="/etc/tune/ddos-guard.env"
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+
+: "${INTERFACE:?missing INTERFACE}"
+: "${SPEED_LIMIT_MBPS:?missing SPEED_LIMIT_MBPS}"
+: "${PACKET_LIMIT_PPS:?missing PACKET_LIMIT_PPS}"
+SAMPLE_SECONDS="${SAMPLE_SECONDS:-30}"
+REQUIRED_SAMPLES="${REQUIRED_SAMPLES:-20}"
+BYTE_LIMIT=$((SPEED_LIMIT_MBPS * 1000 * 1000 / 8))
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-ddos-guard -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+excess_samples=0
+while true; do
+    if ! json="$(vnstat -tr "$SAMPLE_SECONDS" -i "$INTERFACE" --json 2>&1)"; then
+        log_msg warning "vnStat traffic sample failed for ${INTERFACE}: ${json}"
+        sleep 5
+        continue
+    fi
+
+    byte_rate="$(jq -r '(.rx.bytespersecond // 0) + (.tx.bytespersecond // 0)' <<<"$json")"
+    packet_rate="$(jq -r '(.rx.packetspersecond // 0) + (.tx.packetspersecond // 0)' <<<"$json")"
+
+    if [[ ! "$byte_rate" =~ ^[0-9]+$ || ! "$packet_rate" =~ ^[0-9]+$ ]]; then
+        log_msg warning "Unexpected vnStat JSON values: byte_rate=${byte_rate}, packet_rate=${packet_rate}"
+        sleep 5
+        continue
+    fi
+
+    if (( byte_rate > BYTE_LIMIT || packet_rate > PACKET_LIMIT_PPS )); then
+        excess_samples=$((excess_samples + 1))
+    else
+        excess_samples=0
+    fi
+
+    if (( excess_samples >= REQUIRED_SAMPLES )); then
+        log_msg crit "Traffic stayed above threshold for $((SAMPLE_SECONDS * REQUIRED_SAMPLES)) seconds. byte_rate=${byte_rate}B/s limit=${BYTE_LIMIT}B/s packet_rate=${packet_rate}pps limit=${PACKET_LIMIT_PPS}pps. Shutting down."
+        shutdown -h now "Traffic spike threshold exceeded"
+    fi
+done
+EOF_DDOS_SCRIPT
+}
+
+configure_ddos_shutdown() {
+    separator
+    info "Configuring traffic spike shutdown guard"
+
+    local speed_limit packet_limit
+    prompt_int "Traffic threshold in Mbps:" 1 10000000 speed_limit || return 1
+    prompt_int "Packet threshold in packets per second:" 1 100000000 packet_limit || return 1
+
+    if [[ -z "$PRIMARY_IFACE" ]]; then
+        error "No primary network interface detected."
+        return 1
+    fi
+
+    ensure_packages vnstat jq || return 1
+    require_systemd || return 1
+    mkdir -p "$CONFIG_DIR" "$BIN_DIR"
+
+    if systemctl list-unit-files vnstat.service >/dev/null 2>&1; then
+        run_cmd "Enable vnStat service" systemctl enable --now vnstat.service || return 1
+    fi
+    run_shell "Initialize vnStat database for ${PRIMARY_IFACE}" "vnstat --add -i '$PRIMARY_IFACE' >/dev/null 2>&1 || true" || return 1
+
+    write_file "${CONFIG_DIR}/ddos-guard.env" 0600 <<EOF_DDOS_ENV
+INTERFACE="${PRIMARY_IFACE}"
+SPEED_LIMIT_MBPS="${speed_limit}"
+PACKET_LIMIT_PPS="${packet_limit}"
+SAMPLE_SECONDS="30"
+REQUIRED_SAMPLES="20"
+EOF_DDOS_ENV
+    success "Wrote ${CONFIG_DIR}/ddos-guard.env"
+
+    write_ddos_guard_script
+    success "Installed ${BIN_DIR}/tune-ddos-guard"
+
+    write_file /etc/systemd/system/tune-ddos-guard.service 0644 <<'EOF_DDOS_UNIT'
+[Unit]
+Description=Tune Traffic Spike Shutdown Guard
+After=network-online.target vnstat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tune-ddos-guard
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF_DDOS_UNIT
+    enable_start_service tune-ddos-guard.service || return 1
+    service_logs_hint tune-ddos-guard.service
+}
+
+sshd_binary() {
+    mkdir -p /run/sshd 2>/dev/null || true
+    if command_exists sshd; then
+        command -v sshd
+    elif [[ -x /usr/sbin/sshd ]]; then
+        printf '%s\n' /usr/sbin/sshd
+    else
+        return 1
+    fi
+}
+ensure_sshd_include() {
+    mkdir -p "$SSHD_DROPIN_DIR"
+    chmod 0755 "$SSHD_DROPIN_DIR"
+
+    if [[ ! -f "$SSHD_CONFIG" ]]; then
+        error "Missing ${SSHD_CONFIG}. Is openssh-server installed?"
+        return 1
+    fi
+
+    if ! grep -Eiq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$SSHD_CONFIG"; then
+        backup_file "$SSHD_CONFIG" || return 1
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            info "DRY-RUN: would insert Include /etc/ssh/sshd_config.d/*.conf at top of ${SSHD_CONFIG}"
+        else
+            local tmp
+            tmp="$(mktemp)"
+            {
+                printf '%s\n' 'Include /etc/ssh/sshd_config.d/*.conf'
+                cat "$SSHD_CONFIG"
+            } > "$tmp"
+            install -o root -g root -m 0644 "$tmp" "$SSHD_CONFIG"
+            rm -f "$tmp"
+        fi
+    fi
+}
+
+get_sshd_ports() {
+    local bin
+    bin="$(sshd_binary)" || return 1
+    "$bin" -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -nu
+}
+
+validate_sshd_config() {
+    local bin
+    bin="$(sshd_binary)" || return 1
+    run_cmd "Validate SSH server configuration" "$bin" -t
+}
+
+reload_ssh() {
+    if systemd_available; then
+        run_cmd "Reload SSH service" systemctl reload "$SSH_SERVICE" || run_cmd "Restart SSH service" systemctl restart "$SSH_SERVICE"
+    else
+        run_cmd "Reload SSH service" service ssh reload || run_cmd "Restart SSH service" service ssh restart
+    fi
+}
+
+write_sshd_dropin() {
+    local port="$1"
+    local mode="${2:-port_only}"
+    mkdir -p "$SSHD_DROPIN_DIR"
+
+    if [[ "$mode" == "key_only" ]]; then
+        write_file "$SSHD_DROPIN" 0644 <<EOF_SSH_DROPIN
+# Managed by tune.sh. Generated ${RUN_ID}.
+# Validate with: sshd -t
+Port ${port}
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+EOF_SSH_DROPIN
+    else
+        write_file "$SSHD_DROPIN" 0644 <<EOF_SSH_DROPIN
+# Managed by tune.sh. Generated ${RUN_ID}.
+# Validate with: sshd -t
+Port ${port}
+PubkeyAuthentication yes
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+EOF_SSH_DROPIN
+    fi
+}
+comment_global_port_directives_in_sshd_config() {
+    if [[ ! -f "$SSHD_CONFIG" ]]; then
+        return 0
+    fi
+    backup_file "$SSHD_CONFIG" || return 1
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY-RUN: would comment global Port directives in ${SSHD_CONFIG}"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    awk '
+        BEGIN { in_match = 0 }
+        /^[[:space:]]*Match[[:space:]]/ { in_match = 1 }
+        !in_match && /^[[:space:]]*Port[[:space:]]+[0-9]+/ {
+            print "# Managed by tune.sh: disabled because Port is set in /etc/ssh/sshd_config.d/99-tune.conf"
+            print "#" $0
+            next
+        }
+        { print }
+    ' "$SSHD_CONFIG" > "$tmp"
+    install -o root -g root -m 0644 "$tmp" "$SSHD_CONFIG"
+    rm -f "$tmp"
+}
+
+open_ufw_port_if_active() {
+    local port="$1"
+    if command_exists ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        run_cmd "Allow SSH port ${port}/tcp in UFW" ufw allow "${port}/tcp" || return 1
+    fi
+}
+
+configure_fail2ban() {
+    info "Installing and configuring fail2ban for SSH"
+    ensure_packages fail2ban nftables || return 1
+    require_systemd || return 1
+
+    local ports port_csv
+    ports="$(get_sshd_ports 2>/dev/null | paste -sd, -)"
+    port_csv="${ports:-ssh}"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p /etc/fail2ban/jail.d
+    fi
+
+    write_file /etc/fail2ban/jail.d/sshd-tune.local 0644 <<EOF_F2B
+[sshd]
+enabled = true
+mode = aggressive
+port = ${port_csv}
+backend = systemd
+maxretry = 5
+findtime = 1h
+bantime = 1d
+EOF_F2B
+    success "Wrote /etc/fail2ban/jail.d/sshd-tune.local"
+
+    run_cmd "Restart fail2ban" systemctl restart fail2ban.service || {
+        service_logs_hint fail2ban.service
+        return 1
+    }
+    run_cmd "Check fail2ban status" wait_for_fail2ban 30 1 || {
+        service_logs_hint fail2ban.service
+        return 1
+    }
+}
+
+write_disk_scheduler_helper() {
+    write_file "$DISK_SCHEDULER_HELPER" 0755 <<'EOF_DISK_SCHEDULER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-disk-scheduler -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+choose_scheduler() {
+    local available="$1"
+    shift
+    local candidate
+    available="${available//\[/ }"
+    available="${available//\]/ }"
+    for candidate in "$@"; do
+        if grep -qw -- "$candidate" <<< "$available"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if command -v systemd-detect-virt >/dev/null 2>&1; then
+    detected_virt="$(systemd-detect-virt 2>/dev/null || true)"
+    if [[ -n "$detected_virt" && "$detected_virt" != "none" ]]; then
+        log_msg notice "Virtualization (${detected_virt}) detected; disk scheduler changes are skipped."
+        exit 0
+    fi
+fi
+
+shopt -s nullglob
+scheduler_files=(/sys/block/*/queue/scheduler)
+if [[ "${#scheduler_files[@]}" -eq 0 ]]; then
+    log_msg notice "No configurable block-device scheduler was found."
+    exit 0
+fi
+
+for scheduler_file in "${scheduler_files[@]}"; do
+    device="${scheduler_file#/sys/block/}"
+    device="${device%%/*}"
+    case "$device" in
+        loop*|ram*|zram*|sr*|fd*|dm-*|md*) continue ;;
+    esac
+
+    if [[ ! -w "$scheduler_file" ]]; then
+        log_msg warning "Scheduler for ${device} is not writable; skipping."
+        continue
+    fi
+
+    available="$(<"$scheduler_file")"
+    selected=""
+    if [[ "$device" == nvme* ]]; then
+        selected="$(choose_scheduler "$available" none kyber mq-deadline deadline noop || true)"
+    elif [[ "$(cat "/sys/block/${device}/queue/rotational" 2>/dev/null || printf '0')" == "1" ]]; then
+        selected="$(choose_scheduler "$available" mq-deadline deadline bfq kyber cfq none noop || true)"
+    else
+        selected="$(choose_scheduler "$available" kyber mq-deadline none deadline bfq noop || true)"
+    fi
+
+    if [[ -z "$selected" ]]; then
+        log_msg warning "No preferred scheduler is supported by ${device}; available: ${available}."
+        continue
+    fi
+
+    if printf '%s\n' "$selected" > "$scheduler_file"; then
+        log_msg info "Set ${device} scheduler to ${selected} (available: ${available})."
+    else
+        log_msg warning "Could not set ${device} scheduler to ${selected}."
+    fi
+done
+EOF_DISK_SCHEDULER
+
+    write_file "$DISK_SCHEDULER_SERVICE" 0644 <<'EOF_DISK_SCHEDULER_UNIT'
+[Unit]
+Description=Tune Disk I/O Schedulers
+After=systemd-udev-trigger.service
+ConditionPathExistsGlob=/sys/block/*/queue/scheduler
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tune-disk-scheduler-apply
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_DISK_SCHEDULER_UNIT
+}
+
+configure_disk_scheduler() {
+    separator
+    info "Configuring disk I/O schedulers"
+
+    if [[ "$VIRT_KIND" != "none" ]]; then
+        warn "Virtual machine or container detected; disk scheduler tuning is skipped."
+        return 0
+    fi
+    require_systemd || return 1
+
+    write_disk_scheduler_helper
+    success "Installed ${DISK_SCHEDULER_HELPER}"
+    enable_start_service tune-disk-scheduler.service || return 1
+}
+
+verify_file_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        printf 'SHA-256 mismatch for %s: expected %s, got %s\n' "$file" "$expected" "$actual" >&2
+        return 1
+    fi
+}
+
+resolve_bbr_source() {
+    local algo="$1"
+    local source_file sha256
+
+    case "$algo:${OS_ID}:${OS_MAJOR}" in
+        bbrx:debian:12)
+            source_file="tcp_bbrx.c"
+            sha256="a92cd0e85c4803dfdae53722a560b79f3a0f20ae008cf53331b8d1f3424235fe"
+            ;;
+        bbrx:debian:13)
+            source_file="tcp_bbrx_debian13.c"
+            sha256="61d5e01dce308f8e82f5951d53ad59bdbdf2517263344deb3b13f0bbee89cff5"
+            ;;
+        bbrz:debian:12)
+            source_file="tcp_bbrz.c"
+            sha256="32041c154e49bb9f66375a0ec8ed074cb4b8e1c8c70340d2b6130946aff1e7c0"
+            ;;
+        bbrz:debian:13)
+            source_file="tcp_bbrz_debian13.c"
+            sha256="9e475cd34138663fe834b77acf4c98306df6fa2a654dc5a3fe75b526b80a6c51"
+            ;;
+        bbry:debian:13)
+            error "BBRy is not supported on Debian 13; install BBRx or BBRz instead."
+            return 1
+            ;;
+        bbry:debian:*|bbry:ubuntu:*)
+            source_file="tcp_bbry.c"
+            sha256="2aba211ff08fad76d91f992820cb22efbbd9b0786f369d0a3cde410befbd56b3"
+            ;;
+        bbrx:*:*|bbrz:*:*)
+            error "BBRx and BBRz support Debian 12 and Debian 13 only."
+            return 1
+            ;;
+        *)
+            error "Unsupported BBR algorithm: ${algo}."
+            return 1
+            ;;
+    esac
+
+    printf '%s\t%s\t%s\n' "${BBR_SOURCE_BASE}/${source_file}" "$source_file" "$sha256"
+}
+
+remove_existing_dkms_versions() {
+    local algo="$1"
+    local status version
+    local -a versions=()
+
+    status="$(dkms status 2>/dev/null || true)"
+    mapfile -t versions < <(awk -F'[/,]' -v module="$algo" '$1 == module {print $2}' <<< "$status" | sort -u)
+    for version in "${versions[@]}"; do
+        [[ -n "$version" ]] || continue
+        run_cmd "Remove existing DKMS module ${algo}/${version}" dkms remove -m "$algo" -v "$version" --all || return 1
+    done
+}
+
+verify_congestion_control_available() {
+    local algo="$1"
+    local available
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control)"
+    [[ " $available " == *" $algo "* ]]
+}
+
+verify_congestion_control_active() {
+    local algo="$1"
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "$algo" ]]
+}
+
+sync_tune_sysctl_for_bbr() {
+    local algo="$1"
+    local updated
+    [[ -f "$SYSCTL_FILE" ]] || return 0
+
+    updated="$(awk -v cc="$algo" '
+        /^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/ {
+            print "net.core.default_qdisc = fq"
+            qdisc_found=1
+            next
+        }
+        /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {
+            print "net.ipv4.tcp_congestion_control = " cc
+            cc_found=1
+            next
+        }
+        { print }
+        END {
+            if (!qdisc_found) print "net.core.default_qdisc = fq"
+            if (!cc_found) print "net.ipv4.tcp_congestion_control = " cc
+        }
+    ' "$SYSCTL_FILE")"
+    write_file "$SYSCTL_FILE" 0644 <<< "$updated"
+    success "Updated ${SYSCTL_FILE} to preserve ${algo} across sysctl load order."
+}
+
+cleanup_failed_dkms_install() {
+    local algo="$1"
+    dkms remove -m "$algo" -v "$BBR_DKMS_VERSION" --all >/dev/null 2>&1 || true
+}
+
+build_dkms_with_log() {
+    local algo="$1"
+    local version="$2"
+    local kernel_release="$3"
+    local make_log="/var/lib/dkms/${algo}/${version}/build/make.log"
+    local rc=0
+
+    dkms build -m "$algo" -v "$version" -k "$kernel_release" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ -r "$make_log" ]]; then
+            printf '\n### DKMS compiler log: %s\n' "$make_log"
+            cat "$make_log"
+        else
+            printf '\nDKMS compiler log was not readable at %s\n' "$make_log"
+        fi
+    fi
+    return "$rc"
+}
+
+install_bbr_dkms() {
+    local algo="$1"
+    local source_url source_file source_sha kernel_release module_name dkms_source_dir source_path
+    local module_was_loaded=0
+
+    separator
+    info "Installing ${algo} congestion control from pinned source"
+    if [[ "$VIRT_KIND" == "container" ]]; then
+        error "BBR kernel/DKMS installation is not supported inside a container."
+        return 1
+    fi
+
+    IFS=$'\t' read -r source_url source_file source_sha < <(resolve_bbr_source "$algo") || return 1
+    kernel_release="$(uname -r)"
+    module_name="tcp_${algo}"
+    dkms_source_dir="/usr/src/${algo}-${BBR_DKMS_VERSION}"
+    source_path="${dkms_source_dir}/src/${module_name}.c"
+
+    ensure_packages dkms build-essential "linux-headers-${kernel_release}" curl ca-certificates kmod || return 1
+    if [[ "$DRY_RUN" -eq 0 && ! -f "/lib/modules/${kernel_release}/build/Makefile" ]]; then
+        error "The running kernel headers are unavailable after package installation."
+        return 1
+    fi
+    if [[ "$DRY_RUN" -eq 0 && -d "/sys/module/${module_name}" ]]; then
+        module_was_loaded=1
+    fi
+
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        remove_existing_dkms_versions "$algo" || return 1
+    else
+        info "DRY-RUN: would remove existing ${algo} DKMS versions before replacement."
+    fi
+    run_cmd "Remove previous Tune DKMS source for ${algo}" rm -rf -- "$dkms_source_dir" || return 1
+    run_cmd "Create DKMS source directory for ${algo}" install -d -o root -g root -m 0755 "${dkms_source_dir}/src" || return 1
+    run_cmd "Download pinned ${algo} source" curl -fL --retry 3 --connect-timeout 15 --output "$source_path" "$source_url" || return 1
+    run_cmd "Verify pinned ${algo} source" verify_file_sha256 "$source_path" "$source_sha" || return 1
+
+    write_file "${dkms_source_dir}/src/Makefile" 0644 <<EOF_BBR_MAKEFILE
+obj-m += ${module_name}.o
+EOF_BBR_MAKEFILE
+    write_file "${dkms_source_dir}/dkms.conf" 0644 <<EOF_BBR_DKMS
+PACKAGE_NAME="${algo}"
+PACKAGE_VERSION="${BBR_DKMS_VERSION}"
+MAKE[0]="make -C \${kernel_source_dir} M=\${dkms_tree}/${algo}/${BBR_DKMS_VERSION}/build/src modules"
+CLEAN="make -C \${kernel_source_dir} M=\${dkms_tree}/${algo}/${BBR_DKMS_VERSION}/build/src clean"
+BUILT_MODULE_NAME[0]="${module_name}"
+BUILT_MODULE_LOCATION[0]="src/"
+DEST_MODULE_LOCATION[0]="/updates/net/ipv4"
+AUTOINSTALL="yes"
+EOF_BBR_DKMS
+
+    if ! run_cmd "Add ${algo} to DKMS" dkms add -m "$algo" -v "$BBR_DKMS_VERSION"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+    if ! run_cmd "Build ${algo} DKMS module" build_dkms_with_log "$algo" "$BBR_DKMS_VERSION" "$kernel_release"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+    if ! run_cmd "Install ${algo} DKMS module" dkms install -m "$algo" -v "$BBR_DKMS_VERSION" -k "$kernel_release"; then
+        [[ "$DRY_RUN" -eq 1 ]] || cleanup_failed_dkms_install "$algo"
+        return 1
+    fi
+
+    run_cmd "Refresh kernel module dependencies" depmod -a "$kernel_release" || return 1
+    run_cmd "Load ${module_name}" modprobe "$module_name" || return 1
+    run_cmd "Verify ${algo} is available" verify_congestion_control_available "$algo" || return 1
+
+    write_file "$BBR_MODULES_FILE" 0644 <<EOF_BBR_MODULES
+# Managed by tune.sh. Load the selected congestion-control module before sysctl settings.
+${module_name}
+EOF_BBR_MODULES
+    write_file "$BBR_SYSCTL_FILE" 0644 <<EOF_BBR_SYSCTL
+# Managed by tune.sh. Source: ${source_file} at commit ${BBR_SOURCE_COMMIT}.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = ${algo}
+EOF_BBR_SYSCTL
+    sync_tune_sysctl_for_bbr "$algo" || return 1
+    run_cmd "Apply ${algo} congestion control" sysctl -e -p "$BBR_SYSCTL_FILE" || return 1
+    run_cmd "Verify ${algo} is active" verify_congestion_control_active "$algo" || return 1
+
+    if [[ "$module_was_loaded" -eq 1 ]]; then
+        warn "The module was already loaded; reboot to ensure the rebuilt module binary is active."
+    fi
+    success "Installed and activated ${algo}; no reboot was scheduled."
+}
+
+install_bbrx() {
+    install_bbr_dkms bbrx
+}
+
+install_bbry() {
+    install_bbr_dkms bbry
+}
+
+install_bbrz() {
+    install_bbr_dkms bbrz
+}
+
+kernel_base_version() {
+    local release="$1"
+
+    # Distro ABI and custom-build suffixes are not directly comparable; the
+    # downgrade policy intentionally compares only the upstream x.y.z base.
+    if [[ "$release" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+        printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-0}"
+        return 0
+    fi
+    return 1
+}
+
+highest_reference_kernel_version() {
+    local candidate base highest=""
+
+    # The highest installed distro kernel is a conservative proxy for the
+    # persistent boot target, including while a one-shot BBRv3 boot is active.
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        case "${candidate,,}" in
+            *bbr3*|*bbrv3*) continue ;;
+        esac
+        base="$(kernel_base_version "$candidate" || true)"
+        [[ -n "$base" ]] || continue
+        if [[ -z "$highest" ]] || dpkg --compare-versions "$base" gt "$highest"; then
+            highest="$base"
+        fi
+    done < <(
+        uname -r 2>/dev/null || true
+        { dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*' 2>/dev/null || true; } |
+            awk -F '\t' '$1 == "install ok installed" {
+                package=$2
+                sub(/:[^:]+$/, "", package)
+                if (package ~ /^linux-image-unsigned-[0-9]/) {
+                    sub(/^linux-image-unsigned-/, "", package)
+                } else if (package ~ /^linux-image-[0-9]/) {
+                    sub(/^linux-image-/, "", package)
+                } else {
+                    next
+                }
+                print package
+            }'
+    )
+
+    [[ -n "$highest" ]] || return 1
+    printf '%s\n' "$highest"
+}
+
+check_bbrv3_kernel_age() {
+    local reference target="$BBRV3_PAYLOAD_KERNEL_VERSION"
+
+    reference="$(highest_reference_kernel_version || true)"
+    if [[ -z "$reference" ]]; then
+        error "Unable to determine a distribution or running kernel version for the BBRv3 safety check."
+        return 1
+    fi
+
+    notice "BBRv3 kernel safety check: distribution ${reference}, payload ${target}."
+    if ! dpkg --compare-versions "$reference" gt "$target"; then
+        return 0
+    fi
+
+    if [[ "$ALLOW_OLDER_BBRV3_KERNEL" -eq 1 ]]; then
+        warn "Explicit override accepted: BBRv3 payload kernel ${target} is older than distribution kernel ${reference}."
+        return 0
+    fi
+
+    error "Refusing BBRv3 because payload kernel ${target} is older than distribution kernel ${reference}."
+    error "Use --allow-older-bbrv3-kernel to override this safety check explicitly; --yes does not bypass it."
+    return 1
+}
+
+installed_bbrv3_kernel() {
+    { dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*-bbr3*' 'linux-image-*-bbrv3*' 2>/dev/null || true; } |
+        awk -F '\t' '$1 == "install ok installed" {
+            package=$2
+            sub(/:[^:]+$/, "", package)
+            sub(/^linux-image-/, "", package)
+            print package
+        }' |
+        sort -Vu |
+        tail -n 1
+}
+
+grub_bbrv3_boot_entry() {
+    local kernel="$1"
+    local grub_config="/boot/grub/grub.cfg"
+    local submenu_id entry_id
+
+    [[ -r "$grub_config" ]] || return 1
+    submenu_id="$(awk -F "'" '
+        /^[[:space:]]*submenu / && $(NF - 1) ~ /^gnulinux-advanced-/ {
+            print $(NF - 1)
+            exit
+        }
+    ' "$grub_config")"
+    entry_id="$(awk -F "'" -v needle="with Linux ${kernel}" '
+        /^[[:space:]]*menuentry / && index($0, needle) && !index($0, "(recovery mode)") {
+            print $(NF - 1)
+            exit
+        }
+    ' "$grub_config")"
+    [[ -n "$entry_id" ]] || return 1
+
+    if [[ -n "$submenu_id" ]]; then
+        printf '%s>%s\n' "$submenu_id" "$entry_id"
+    else
+        printf '%s\n' "$entry_id"
+    fi
+}
+
+verify_grub_next_entry() {
+    local expected="$1" actual
+    actual="$(grub-editenv list 2>/dev/null | sed -n 's/^next_entry=//p')"
+    [[ "$actual" == "$expected" ]]
+}
+
+schedule_bbrv3_next_boot() {
+    local kernel selection
+
+    if ! command_exists grub-reboot || ! command_exists grub-editenv; then
+        error "grub-reboot and grub-editenv are required to select the BBRv3 kernel safely."
+        return 1
+    fi
+
+    kernel="$(installed_bbrv3_kernel || true)"
+    if [[ -z "$kernel" || ! -s "/boot/vmlinuz-${kernel}" ]]; then
+        error "No installed BBRv3 kernel package was found after the installer completed."
+        return 1
+    fi
+    selection="$(grub_bbrv3_boot_entry "$kernel" || true)"
+    if [[ -z "$selection" ]]; then
+        error "The GRUB menu entry for ${kernel} was not found."
+        return 1
+    fi
+
+    run_cmd "Set one-time GRUB boot entry for ${kernel}" grub-reboot "$selection" || return 1
+    run_cmd "Verify one-time GRUB boot entry for ${kernel}" verify_grub_next_entry "$selection" || return 1
+    success "Scheduled ${kernel} for the next boot only; the persistent GRUB default was not changed."
+}
+
+install_bbrv3() {
+    local installer lang_code="en" rc=0
+    local -a installer_cmd=()
+
+    separator
+    info "Installing BBRv3 with the pinned Dedicated installer"
+    if [[ "$VIRT_KIND" == "container" ]]; then
+        error "BBR kernel/DKMS installation is not supported inside a container."
+        return 1
+    fi
+
+    check_bbrv3_kernel_age || return 1
+    ensure_packages curl ca-certificates || return 1
+    installer="$(mktemp)"
+    [[ "$LANGUAGE" == "zh-CN" ]] && lang_code="zh-TW"
+
+    if ! run_cmd "Download pinned BBRv3 installer" curl -fL --retry 3 --connect-timeout 15 --output "$installer" "$BBRV3_INSTALLER_URL"; then
+        rm -f -- "$installer"
+        return 1
+    fi
+    if ! run_cmd "Verify pinned BBRv3 installer" verify_file_sha256 "$installer" "$BBRV3_INSTALLER_SHA256"; then
+        rm -f -- "$installer"
+        return 1
+    fi
+
+    installer_cmd=(env "BBR_ALGO=bbrv3" "BBR_LANG=${lang_code}" "RAW_BASE=${TUNE_BBRV3_RAW_BASE:-$BBRV3_PAYLOAD_BASE}")
+    installer_cmd+=(bash "$installer" --algo bbrv3)
+    run_cmd "Run pinned BBRv3 installer" "${installer_cmd[@]}" || rc=$?
+    rm -f -- "$installer"
+    if [[ "$rc" -ne 0 ]]; then
+        return "$rc"
+    fi
+
+    run_cmd "Remove custom BBR module autoload for BBRv3" rm -f -- "$BBR_MODULES_FILE" || return 1
+    write_file "$BBR_SYSCTL_FILE" 0644 <<EOF_BBRV3_SYSCTL
+# Managed by tune.sh. BBRv3 installer commit: ${BBRV3_INSTALLER_COMMIT}; payload commit: ${BBRV3_PAYLOAD_COMMIT}.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF_BBRV3_SYSCTL
+    sync_tune_sysctl_for_bbr bbr || return 1
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY-RUN: would select the installed BBRv3 kernel for the next boot only."
+    else
+        schedule_bbrv3_next_boot || return 1
+    fi
+    success "BBRv3 installer completed; a one-time BBRv3 boot was selected, but reboot was not scheduled."
+}
+
+configure_ssh_security() {
+    separator
+    info "Configuring SSH hardening"
+
+    ensure_packages openssh-server || return 1
+    require_systemd || return 1
+    ensure_sshd_include || return 1
+
+    local new_ssh_port
+    prompt_int "New SSH port (1-65535):" 1 65535 new_ssh_port || return 1
+
+    if command_exists ss && ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${new_ssh_port}$"; then
+        warn "Port ${new_ssh_port} already appears to be listening. SSH may already use it, or another service may conflict."
+    fi
+
+    open_ufw_port_if_active "$new_ssh_port" || return 1
+
+    local existing_ports=()
+    mapfile -t existing_ports < <(get_sshd_ports 2>/dev/null || true)
+    if [[ "${#existing_ports[@]}" -eq 0 ]]; then
+        existing_ports=(22)
+    fi
+
+    # Stage 1: keep current ports and add the new port, so the user can test before old ports are removed.
+    local stage_file
+    stage_file="$(mktemp)"
+    {
+        printf '# Managed by tune.sh. Temporary test config generated %s.\n' "$RUN_ID"
+        for p in "${existing_ports[@]}" "$new_ssh_port"; do
+            printf 'Port %s\n' "$p"
+        done | awk '!seen[$0]++'
+        printf '%s\n' 'PubkeyAuthentication yes'
+    } > "$stage_file"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY-RUN: would write temporary SSH drop-in ${SSHD_DROPIN}"
+        sed 's/^/  | /' "$stage_file" || true
+        rm -f "$stage_file"
+    else
+        install -o root -g root -m 0644 "$stage_file" "$SSHD_DROPIN"
+        rm -f "$stage_file"
+    fi
+
+    validate_sshd_config || return 1
+    reload_ssh || return 1
+
+    warn "Open a second SSH session now and verify that port ${new_ssh_port} works before continuing."
+    if ! prompt_yes_no "Can you log in through SSH port ${new_ssh_port}?" n; then
+        warn "Keeping the existing SSH configuration. New port was not finalized."
+        return 1
+    fi
+
+    comment_global_port_directives_in_sshd_config || return 1
+    write_sshd_dropin "$new_ssh_port" "port_only"
+    validate_sshd_config || return 1
+    reload_ssh || return 1
+    success "SSH now listens on port ${new_ssh_port}. Existing global Port directives were backed up/commented."
+
+    if [[ ! -s /root/.ssh/authorized_keys ]]; then
+        warn "No /root/.ssh/authorized_keys file was found. Password authentication will not be disabled automatically."
+    else
+        warn "Before disabling passwords, verify key login in a second SSH session."
+        if prompt_yes_no "Can you log in with an SSH key?" n; then
+            write_sshd_dropin "$new_ssh_port" "key_only"
+            validate_sshd_config || return 1
+            reload_ssh || return 1
+            success "SSH password and keyboard-interactive authentication disabled. Root login is key-only/prohibit-password."
+        else
+            warn "Password authentication left enabled."
+        fi
+    fi
+
+    configure_fail2ban || return 1
+}
+
+compute_memory_tuning() {
+    local mem_size
+    mem_size="$(awk '/MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)"
+
+    rmem_default=131072
+    wmem_default=131072
+    swappiness=10
+
+    if (( mem_size <= 128 )); then
+        rmem_max=4194304
+        wmem_max=4194304
+        tcp_rmem="4096 87380 4194304"
+        tcp_wmem="4096 32768 4194304"
+        notsent_lowat=65536
+        somaxconn=4096
+        syn_backlog=2048
+        netdev_backlog=1000
+        dirty_bg=2097152
+        dirty=8388608
+        file_max=262144
+    elif (( mem_size <= 256 )); then
+        rmem_max=8388608
+        wmem_max=8388608
+        tcp_rmem="4096 131072 12582912"
+        tcp_wmem="4096 65536 12582912"
+        notsent_lowat=65536
+        somaxconn=8192
+        syn_backlog=4096
+        netdev_backlog=2000
+        dirty_bg=4194304
+        dirty=16777216
+        file_max=524288
+    elif (( mem_size <= 512 )); then
+        rmem_default=262144
+        wmem_default=262144
+        rmem_max=16777216
+        wmem_max=16777216
+        tcp_rmem="4096 131072 16777216"
+        tcp_wmem="4096 65536 16777216"
+        notsent_lowat=131072
+        somaxconn=16384
+        syn_backlog=8192
+        netdev_backlog=4096
+        dirty_bg=8388608
+        dirty=33554432
+        file_max=1048576
+    elif (( mem_size <= 1024 )); then
+        rmem_default=262144
+        wmem_default=262144
+        rmem_max=16777216
+        wmem_max=16777216
+        tcp_rmem="4096 131072 16777216"
+        tcp_wmem="4096 65536 16777216"
+        notsent_lowat=131072
+        somaxconn=32768
+        syn_backlog=16384
+        netdev_backlog=8192
+        dirty_bg=16777216
+        dirty=67108864
+        file_max=1048576
+    elif (( mem_size <= 2048 )); then
+        rmem_default=262144
+        wmem_default=262144
+        rmem_max=33554432
+        wmem_max=33554432
+        tcp_rmem="4096 131072 33554432"
+        tcp_wmem="4096 65536 33554432"
+        notsent_lowat=131072
+        somaxconn=65535
+        syn_backlog=32768
+        netdev_backlog=16384
+        dirty_bg=33554432
+        dirty=134217728
+        file_max=2097152
+    else
+        rmem_default=262144
+        wmem_default=262144
+        rmem_max=33554432
+        wmem_max=33554432
+        tcp_rmem="4096 131072 33554432"
+        tcp_wmem="4096 65536 33554432"
+        notsent_lowat=131072
+        somaxconn=65535
+        syn_backlog=32768
+        netdev_backlog=32768
+        dirty_bg=67108864
+        dirty=268435456
+        file_max=2097152
+    fi
+}
+
+write_sysctl_tuning() {
+    if [[ "$VIRT_KIND" == "container" ]]; then
+        warn "Container detected (${VIRT_TECH}). Skipping sysctl tuning because many kernel parameters are controlled by the host."
+        return 0
+    fi
+
+    install_linux_sysctl_defaults_if_needed
+    compute_memory_tuning
+
+    local custom_module="" preferred_cc="" available_cc=""
+    if [[ -r "$BBR_MODULES_FILE" ]]; then
+        custom_module="$(awk '!/^[[:space:]]*(#|$)/ {print $1; exit}' "$BBR_MODULES_FILE")"
+        case "$custom_module" in
+            tcp_bbrx|tcp_bbry|tcp_bbrz)
+                if [[ "$DRY_RUN" -eq 0 ]]; then
+                    modprobe "$custom_module" 2>/dev/null || true
+                fi
+                ;;
+            *) custom_module="" ;;
+        esac
+    fi
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        modprobe tcp_bbr 2>/dev/null || true
+        modprobe sch_fq 2>/dev/null || true
+    fi
+
+    local congestion_control default_qdisc
+    available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    if [[ "$DRY_RUN" -eq 1 ]] && command_exists modinfo; then
+        if [[ -n "$custom_module" ]] && modinfo "$custom_module" >/dev/null 2>&1; then
+            available_cc+=" ${custom_module#tcp_}"
+        fi
+        if modinfo tcp_bbr >/dev/null 2>&1; then
+            available_cc+=" bbr"
+        fi
+    fi
+    if [[ -r "$BBR_SYSCTL_FILE" ]]; then
+        preferred_cc="$(awk -F= '
+            /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/ {
+                value=$2
+                gsub(/[[:space:]]/, "", value)
+                print value
+                exit
+            }
+        ' "$BBR_SYSCTL_FILE")"
+        case "$preferred_cc" in
+            bbrx|bbry|bbrz) ;;
+            *) preferred_cc="" ;;
+        esac
+    fi
+
+    if [[ -n "$preferred_cc" && " $available_cc " == *" $preferred_cc "* ]]; then
+        congestion_control="$preferred_cc"
+        default_qdisc="fq"
+    elif [[ " $available_cc " == *" bbr "* ]]; then
+        congestion_control="bbr"
+        default_qdisc="fq"
+    else
+        congestion_control="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic)"
+        default_qdisc="fq_codel"
+        warn "BBR is not available in the current kernel; keeping congestion control as ${congestion_control}."
+    fi
+
+    write_file "$SYSCTL_FILE" 0644 <<EOF_SYSCTL
+# Managed by tune.sh. Generated ${RUN_ID}.
+# Debian 13/trixie: local sysctl settings should live in /etc/sysctl.d/*.conf.
+# Lines prefixed with '-' are allowed to fail on kernels that do not expose that key.
+
+# Socket buffers
+net.core.rmem_default = ${rmem_default}
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_default = ${wmem_default}
+net.core.wmem_max = ${wmem_max}
+net.ipv4.tcp_rmem = ${tcp_rmem}
+net.ipv4.tcp_wmem = ${tcp_wmem}
+net.ipv4.tcp_moderate_rcvbuf = 1
+
+# TCP behavior for long-lived/high-throughput connections
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = ${notsent_lowat}
+net.core.somaxconn = ${somaxconn}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_abort_on_overflow = 0
+net.core.netdev_max_backlog = ${netdev_backlog}
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 30
+
+# File handle and VM writeback ceiling
+fs.file-max = ${file_max}
+vm.dirty_background_bytes = ${dirty_bg}
+vm.dirty_bytes = ${dirty}
+vm.swappiness = ${swappiness}
+
+# Safer baseline network hardening for non-router servers
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Local kernel hardening. Optional keys may not exist on every kernel.
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+-fs.protected_fifos = 2
+-fs.protected_regular = 2
+kernel.dmesg_restrict = 1
+-kernel.kptr_restrict = 2
+-kernel.unprivileged_bpf_disabled = 1
+-net.core.bpf_jit_harden = 2
+
+# Queue discipline and congestion control
+net.core.default_qdisc = ${default_qdisc}
+net.ipv4.tcp_congestion_control = ${congestion_control}
+EOF_SYSCTL
+    success "Wrote ${SYSCTL_FILE}"
+
+    run_cmd "Apply sysctl tuning from ${SYSCTL_FILE}" sysctl -e -p "$SYSCTL_FILE" || return 1
+}
+
+write_limits_tuning() {
+    write_file "$LIMITS_FILE" 0644 <<'EOF_LIMITS'
+# Managed by tune.sh.
+* soft nofile 1048576
+* hard nofile 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+EOF_LIMITS
+    success "Wrote ${LIMITS_FILE}"
+
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$SYSTEMD_LIMITS_DIR"
+    fi
+    write_file "$SYSTEMD_LIMITS_FILE" 0644 <<'EOF_SYSTEMD_LIMITS'
+# Managed by tune.sh.
+[Manager]
+DefaultLimitNOFILE=1048576
+EOF_SYSTEMD_LIMITS
+    success "Wrote ${SYSTEMD_LIMITS_FILE}. A reboot or systemd daemon-reexec is required for manager-wide defaults."
+}
+
+ring_buffer_values() {
+    local iface="$1"
+    local speed ring_info max_values rx_max tx_max target rx_target tx_target
+
+    speed="$(ethtool "$iface" 2>/dev/null | awk -F': *' '
+        /^[[:space:]]*Speed:/ {
+            value=$2
+            sub(/Mb\/s.*/, "", value)
+            gsub(/[[:space:]]/, "", value)
+            if (value ~ /^[0-9]+$/) print value
+            exit
+        }
+    ')"
+    [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )) || return 1
+
+    ring_info="$(ethtool -g "$iface" 2>/dev/null)" || return 1
+    max_values="$(awk '
+        /Pre-set maximums:/ { section="max"; next }
+        /Current hardware settings:/ { section="current"; next }
+        section == "max" && $1 == "RX:" && $2 ~ /^[0-9]+$/ { rx=$2 }
+        section == "max" && $1 == "TX:" && $2 ~ /^[0-9]+$/ { tx=$2 }
+        END {
+            if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) print rx "\t" tx
+            else exit 1
+        }
+    ' <<< "$ring_info")" || return 1
+    IFS=$'\t' read -r rx_max tx_max <<< "$max_values"
+
+    if (( speed <= 1000 )); then
+        target=1024
+    elif (( speed <= 10000 )); then
+        target=4096
+    else
+        target=8192
+    fi
+
+    rx_target=$(( rx_max < target ? rx_max : target ))
+    tx_target=$(( tx_max < target ? tx_max : target ))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$rx_target" "$tx_target" "$rx_max" "$tx_max"
+}
+
+set_initial_congestion_window() {
+    local route gateway="" device="" proto="" src="" metric="" updated
+    local -a fields=() route_cmd=(ip route change default)
+    local i
+
+    route="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    if [[ -z "$route" ]]; then
+        printf '%s\n' "No IPv4 default route was found." >&2
+        return 1
+    fi
+
+    IFS=' ' read -r -a fields <<< "$route"
+    for ((i=0; i<${#fields[@]}; i++)); do
+        (( i + 1 < ${#fields[@]} )) || continue
+        case "${fields[$i]}" in
+            via) gateway="${fields[$((i + 1))]}" ;;
+            dev) device="${fields[$((i + 1))]}" ;;
+            proto) proto="${fields[$((i + 1))]}" ;;
+            src) src="${fields[$((i + 1))]}" ;;
+            metric) metric="${fields[$((i + 1))]}" ;;
+        esac
+    done
+
+    if [[ -z "$device" ]] || ! validate_iface_name "$device" || ! ip link show dev "$device" >/dev/null 2>&1; then
+        printf '%s\n' "The default-route network device is missing or invalid: ${device:-unknown}." >&2
+        return 1
+    fi
+    if [[ -n "$metric" && ! "$metric" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "The default-route metric is invalid: ${metric}." >&2
+        return 1
+    fi
+
+    [[ -n "$gateway" ]] && route_cmd+=(via "$gateway")
+    route_cmd+=(dev "$device")
+    [[ -n "$proto" ]] && route_cmd+=(proto "$proto")
+    [[ -n "$src" ]] && route_cmd+=(src "$src")
+    [[ -n "$metric" ]] && route_cmd+=(metric "$metric")
+    route_cmd+=(initcwnd 100 initrwnd 100)
+
+    "${route_cmd[@]}" || return 1
+
+    updated="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    if [[ " $updated " != *" initcwnd 100 "* || " $updated " != *" initrwnd 100 "* ]]; then
+        printf '%s\n' "The default route did not retain initcwnd/initrwnd 100 after the change." >&2
+        return 1
+    fi
+}
+
+write_netdev_boot_helper() {
+    write_file "${BIN_DIR}/tune-boot-apply" 0755 <<'EOF_NETDEV'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+log_msg() {
+    local priority="$1"
+    shift
+    if command -v systemd-cat >/dev/null 2>&1; then
+        printf '%s\n' "$*" | systemd-cat -t tune-boot-apply -p "$priority" || true
+    fi
+    printf '%s [%s] %s\n' "$(date -Is)" "$priority" "$*"
+}
+
+primary_iface() {
+    ip -o -4 route show to default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' | cut -d'@' -f1
+}
+
+virt_kind() {
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        if systemd-detect-virt --container >/dev/null 2>&1; then
+            printf 'container\n'
+        elif systemd-detect-virt --vm >/dev/null 2>&1; then
+            printf 'vm\n'
+        else
+            printf 'none\n'
+        fi
+    else
+        printf 'unknown\n'
+    fi
+}
+
+ring_buffer_values() {
+    local target_iface="$1"
+    local speed ring_info max_values rx_max tx_max target rx_target tx_target
+
+    speed="$(ethtool "$target_iface" 2>/dev/null | awk -F': *' '
+        /^[[:space:]]*Speed:/ {
+            value=$2
+            sub(/Mb\/s.*/, "", value)
+            gsub(/[[:space:]]/, "", value)
+            if (value ~ /^[0-9]+$/) print value
+            exit
+        }
+    ')"
+    [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )) || return 1
+
+    ring_info="$(ethtool -g "$target_iface" 2>/dev/null)" || return 1
+    max_values="$(awk '
+        /Pre-set maximums:/ { section="max"; next }
+        /Current hardware settings:/ { section="current"; next }
+        section == "max" && $1 == "RX:" && $2 ~ /^[0-9]+$/ { rx=$2 }
+        section == "max" && $1 == "TX:" && $2 ~ /^[0-9]+$/ { tx=$2 }
+        END {
+            if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) print rx "\t" tx
+            else exit 1
+        }
+    ' <<< "$ring_info")" || return 1
+    IFS=$'\t' read -r rx_max tx_max <<< "$max_values"
+
+    if (( speed <= 1000 )); then
+        target=1024
+    elif (( speed <= 10000 )); then
+        target=4096
+    else
+        target=8192
+    fi
+
+    rx_target=$(( rx_max < target ? rx_max : target ))
+    tx_target=$(( tx_max < target ? tx_max : target ))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$rx_target" "$tx_target" "$rx_max" "$tx_max"
+}
+
+set_initial_congestion_window() {
+    local route gateway="" device="" proto="" src="" metric="" updated
+    local -a fields=() route_cmd=(ip route change default)
+    local i
+
+    route="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    [[ -n "$route" ]] || return 1
+    IFS=' ' read -r -a fields <<< "$route"
+    for ((i=0; i<${#fields[@]}; i++)); do
+        (( i + 1 < ${#fields[@]} )) || continue
+        case "${fields[$i]}" in
+            via) gateway="${fields[$((i + 1))]}" ;;
+            dev) device="${fields[$((i + 1))]}" ;;
+            proto) proto="${fields[$((i + 1))]}" ;;
+            src) src="${fields[$((i + 1))]}" ;;
+            metric) metric="${fields[$((i + 1))]}" ;;
+        esac
+    done
+
+    [[ -n "$device" && "$device" =~ ^[A-Za-z0-9_.:@-]+$ ]] || return 1
+    ip link show dev "$device" >/dev/null 2>&1 || return 1
+    [[ -z "$metric" || "$metric" =~ ^[0-9]+$ ]] || return 1
+
+    [[ -n "$gateway" ]] && route_cmd+=(via "$gateway")
+    route_cmd+=(dev "$device")
+    [[ -n "$proto" ]] && route_cmd+=(proto "$proto")
+    [[ -n "$src" ]] && route_cmd+=(src "$src")
+    [[ -n "$metric" ]] && route_cmd+=(metric "$metric")
+    route_cmd+=(initcwnd 100 initrwnd 100)
+    "${route_cmd[@]}" || return 1
+
+    updated="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    [[ " $updated " == *" initcwnd 100 "* && " $updated " == *" initrwnd 100 "* ]]
+}
+
+iface="$(primary_iface)"
+if [[ -z "$iface" ]]; then
+    log_msg warning "No default-route network interface detected."
+    exit 0
+fi
+
+kind="$(virt_kind)"
+
+if command -v ethtool >/dev/null 2>&1; then
+    if [[ "$kind" == "none" ]]; then
+        if IFS=$'\t' read -r ring_target rx_target tx_target rx_max tx_max < <(ring_buffer_values "$iface"); then
+            log_msg info "${iface}: ring target=${ring_target}, RX=${rx_target}/${rx_max}, TX=${tx_target}/${tx_max}."
+            if (( rx_target > 0 )); then
+                ethtool -G "$iface" rx "$rx_target" >/dev/null 2>&1 || log_msg warning "Could not set RX ring buffer on ${iface}; driver may not support it."
+            fi
+            if (( tx_target > 0 )); then
+                ethtool -G "$iface" tx "$tx_target" >/dev/null 2>&1 || log_msg warning "Could not set TX ring buffer on ${iface}; driver may not support it."
+            fi
+        else
+            log_msg warning "Could not safely read link speed and ring-buffer maxima for ${iface}; ring tuning was skipped."
+        fi
+    else
+        ethtool -K "$iface" tso off gso off gro off >/dev/null 2>&1 || log_msg warning "Could not disable offloads on ${iface}; hypervisor/driver may not support it."
+    fi
+fi
+
+if [[ "$kind" != "container" ]]; then
+    ip link set dev "$iface" txqueuelen 10000 >/dev/null 2>&1 || log_msg warning "Could not set txqueuelen on ${iface}."
+    set_initial_congestion_window >/dev/null 2>&1 || log_msg warning "Could not set and verify the initial congestion window on the IPv4 default route."
+fi
+EOF_NETDEV
+
+    write_file /etc/systemd/system/tune-boot-apply.service 0644 <<'EOF_NETDEV_UNIT'
+[Unit]
+Description=Tune Network Device Tuning
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/root/BBRx.sh
-RemainAfterExit=true
+ExecStart=/usr/local/sbin/tune-boot-apply
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable bbrinstall.service
-	return 0
-}
+EOF_NETDEV_UNIT
 
-install_bbry_() {
-	#Check if $OS is Set
-	if [[ -z $OS ]]; then
-		# Linux Distro Version check
-		if [ -f /etc/os-release ]; then
-			. /etc/os-release
-			OS=$NAME
-		elif type lsb_release >/dev/null 2>&1; then
-			OS=$(lsb_release -si)
-		elif [ -f /etc/lsb-release ]; then
-			. /etc/lsb-release
-			OS=$DISTRIB_ID
-		elif [ -f /etc/debian_version ]; then
-			OS=Debian
-		else
-			OS=$(uname -s)
-			VER=$(uname -r)
-		fi
-	fi
-	if [[ "$OS" =~ "Debian" ]]; then
-		if [ $(uname -m) == "x86_64" ]; then
-			apt-get -y install linux-image-amd64 linux-headers-amd64
-			if [ $? -ne 0 ]; then
-				fail "BBRy installation failed"
-				return 1
-			fi
-		elif [ $(uname -m) == "aarch64" ]; then
-			apt-get -y install linux-image-arm64 linux-headers-arm64
-			if [ $? -ne 0 ]; then
-				fail "BBRy installation failed"
-				return 1
-			fi
-		fi
-	elif [[ "$OS" =~ "Ubuntu" ]]; then
-		apt-get -y install linux-image-generic linux-headers-generic
-		if [ $? -ne 0 ]; then
-			fail "BBRy installation failed"
-			return 1
-		fi
-	else
-		fail "Unsupported OS"
-		return 1
-	fi
-	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRy.sh && chmod +x BBRy.sh
-	# Check if download fail
-	if [ ! -f BBRy.sh ]; then
-		fail "BBRy download failed"
-		return 1
-	fi
-    ## Install tweaked BBR automatically on reboot
-    cat << EOF > /etc/systemd/system/bbrinstall.service
+    write_file /etc/systemd/system/tune-boot-apply.timer 0644 <<'EOF_NETDEV_TIMER'
 [Unit]
-Description=BBRinstall
-After=network.target
+Description=Periodically Reapply Tune Network Device Settings
 
-[Service]
-Type=oneshot
-ExecStart=/root/BBRy.sh
-RemainAfterExit=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable bbrinstall.service
-	return 0
-}
-
-install_bbrz_() {
-	#Check if $OS is Set
-	if [[ -z $OS ]]; then
-		# Linux Distro Version check
-		if [ -f /etc/os-release ]; then
-			. /etc/os-release
-			OS=$NAME
-		elif type lsb_release >/dev/null 2>&1; then
-			OS=$(lsb_release -si)
-		elif [ -f /etc/lsb-release ]; then
-			. /etc/lsb-release
-			OS=$DISTRIB_ID
-		elif [ -f /etc/debian_version ]; then
-			OS=Debian
-		else
-			OS=$(uname -s)
-			VER=$(uname -r)
-		fi
-	fi
-	if [[ "$OS" =~ "Debian" ]]; then
-		if [ $(uname -m) == "x86_64" ]; then
-			apt-get -y install linux-image-amd64 linux-headers-amd64
-			if [ $? -ne 0 ]; then
-				fail "BBRz installation failed"
-				return 1
-			fi
-		elif [ $(uname -m) == "aarch64" ]; then
-			apt-get -y install linux-image-arm64 linux-headers-arm64
-			if [ $? -ne 0 ]; then
-				fail "BBRz installation failed"
-				return 1
-			fi
-		fi
-	elif [[ "$OS" =~ "Ubuntu" ]]; then
-		apt-get -y install linux-image-generic linux-headers-generic
-		if [ $? -ne 0 ]; then
-			fail "BBRz installation failed"
-			return 1
-		fi
-	else
-		fail "Unsupported OS"
-		return 1
-	fi
-	wget https://raw.githubusercontent.com/guowanghushifu/Seedbox-Components/main/BBR/BBRx/BBRz.sh && chmod +x BBRz.sh
-	# Check if download fail
-	if [ ! -f BBRz.sh ]; then
-		fail "BBRz download failed"
-		return 1
-	fi
-    ## Install tweaked BBR automatically on reboot
-    cat << EOF > /etc/systemd/system/bbrinstall.service
-[Unit]
-Description=BBRinstall
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/root/BBRz.sh
-RemainAfterExit=true
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=tune-boot-apply.service
 
 [Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable bbrinstall.service
-	return 0
+WantedBy=timers.target
+EOF_NETDEV_TIMER
 }
 
-install_bbrv3_() {
-	if [ $(uname -m) == "x86_64" ]; then
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/x86_64/linux-headers-6.4.0+-amd64.deb -O /root/linux-headers-6.4.0+-amd64.deb
-		if [ ! -f /root/linux-headers-6.4.0+-amd64.deb ]; then
-			fail "BBRv3 download failed"
-			return 1
-		fi
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/x86_64/linux-image-6.4.0+-amd64.deb -O /root/linux-image-6.4.0+-amd64.deb
-		if [ ! -f /root/linux-image-6.4.0+-amd64.deb ]; then
-			fail "BBRv3 download failed"
-			rm /root/linux-headers-6.4.0+-amd64.deb
-			return 1
-		fi
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/x86_64/linux-libc-dev_-6.4.0-amd64.deb -O /root/linux-libc-dev_-6.4.0-amd64.deb
-		if [ ! -f /root/linux-libc-dev_-6.4.0-amd64.deb ]; then
-			fail "BBRv3 download failed"
-			rm /root/linux-headers-6.4.0+-amd64.deb /root/linux-image-6.4.0+-amd64.deb
-			return 1
-		fi
-		apt install /root/linux-headers-6.4.0+-amd64.deb /root/linux-image-6.4.0+-amd64.deb /root/linux-libc-dev_-6.4.0-amd64.deb
-		# Clean up
-		rm /root/linux-headers-6.4.0+-amd64.deb /root/linux-image-6.4.0+-amd64.deb /root/linux-libc-dev_-6.4.0-amd64.deb
-	elif [ $(uname -m) == "aarch64" ]; then
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/ARM64/linux-headers-6.4.0+-arm64.deb -O /root/linux-headers-6.4.0+-arm64.deb
-		if [ ! -f /root/linux-headers-6.4.0+-arm64.deb ]; then
-			fail "BBRv3 download failed"
-			return 1
-		fi
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/ARM64/linux-image-6.4.0+-arm64.deb -O /root/linux-image-6.4.0+-arm64.deb
-		if [ ! -f /root/linux-image-6.4.0+-arm64.deb ]; then
-			fail "BBRv3 download failed"
-			rm /root/linux-headers-6.4.0+-arm64.deb
-			return 1
-		fi
-		wget https://raw.githubusercontent.com/jerry048/Seedbox-Components/main/BBR/BBRv3/ARM64/linux-libc-dev_-6.4.0-arm64.deb -O /root/linux-libc-dev_-6.4.0-arm64.deb
-		if [ ! -f /root/linux-libc-dev_-6.4.0-arm64.deb ]; then
-			fail "BBRv3 download failed"
-			rm /root/linux-headers-6.4.0+-arm64.deb linux-image-6.4.0+-arm64.deb
-			return 1
-		fi
-		apt install /root/linux-headers-6.4.0+-arm64.deb /root/linux-image-6.4.0+-arm64.deb /root/linux-libc-dev_-6.4.0-arm64.deb
-		# Clean up
-		rm /root/linux-headers-6.4.0+-arm64.deb /root/linux-image-6.4.0+-arm64.deb /root/linux-libc-dev_-6.4.0-arm64.deb
-	else
-		fail "$(uname -m) is not supported"
-	fi
-	return 0
+apply_netdev_tuning_now() {
+    if [[ -z "$PRIMARY_IFACE" ]]; then
+        warn "No primary interface detected. Skipping netdev tuning."
+        return 0
+    fi
+
+    ensure_packages ethtool || return 1
+
+    if [[ "$VIRT_KIND" == "none" ]]; then
+        local ring_target rx_target tx_target rx_max tx_max
+        if IFS=$'\t' read -r ring_target rx_target tx_target rx_max tx_max < <(ring_buffer_values "$PRIMARY_IFACE"); then
+            info "Ring buffer target for ${PRIMARY_IFACE}: ${ring_target} (RX ${rx_target}/${rx_max}, TX ${tx_target}/${tx_max})"
+            if (( rx_target > 0 )); then
+                run_cmd "Set RX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" rx "$rx_target" || warn "RX ring tuning skipped; unsupported by this NIC/driver."
+            fi
+            if (( tx_target > 0 )); then
+                run_cmd "Set TX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" tx "$tx_target" || warn "TX ring tuning skipped; unsupported by this NIC/driver."
+            fi
+        else
+            warn "Ring buffer tuning skipped because link speed or hardware maxima could not be read safely."
+        fi
+    else
+        run_cmd "Disable TSO/GSO/GRO offloads on ${PRIMARY_IFACE}" ethtool -K "$PRIMARY_IFACE" tso off gso off gro off || warn "Offload tuning skipped; unsupported by this NIC/driver/hypervisor."
+    fi
+
+    if [[ "$VIRT_KIND" != "container" ]]; then
+        run_cmd "Set txqueuelen on ${PRIMARY_IFACE}" ip link set dev "$PRIMARY_IFACE" txqueuelen 10000 || warn "txqueuelen tuning skipped."
+        run_cmd "Set initial congestion window on default route" set_initial_congestion_window || warn "Initial congestion window tuning skipped."
+    else
+        warn "Container detected; skipping link queue and route tuning."
+    fi
 }
 
+apply_system_tuning() {
+    separator
+    info "Applying system tuning"
 
-## Main
+    write_limits_tuning
+    write_sysctl_tuning || return 1
+    apply_netdev_tuning_now || return 1
+
+    if systemd_available; then
+        write_netdev_boot_helper
+        success "Installed ${BIN_DIR}/tune-boot-apply"
+        reload_systemd || return 1
+        run_cmd "Disable direct boot activation of tune-boot-apply.service" systemctl disable --now tune-boot-apply.service || return 1
+        run_cmd "Enable and start tune-boot-apply.timer" systemctl enable --now tune-boot-apply.timer || {
+            service_logs_hint tune-boot-apply.timer
+            return 1
+        }
+        run_cmd "Check tune-boot-apply.timer is active" systemctl is-active --quiet tune-boot-apply.timer || {
+            service_logs_hint tune-boot-apply.timer
+            return 1
+        }
+    fi
+
+    success "System tuning completed. Some limits require a reboot or a new login session to fully apply."
+}
+
+run_action() {
+    local label="$1"
+    local function_name="$2"
+    CURRENT_ACTION_LOGS=()
+    LAST_FAILURE_CAUSE=""
+
+    info "Action: ${label}"
+    if "$function_name"; then
+        record_summary "$label" "SUCCESS" "$(join_by ', ' "${CURRENT_ACTION_LOGS[@]}")"
+        status_ok "$label"
+        return 0
+    fi
+
+    record_summary "$label" "FAILED" "$(join_by ', ' "${CURRENT_ACTION_LOGS[@]}")"
+    status_failed "$label"
+    [[ -n "$LAST_FAILURE_CAUSE" ]] && error "Likely cause: ${LAST_FAILURE_CAUSE}"
+    return 1
+}
+
+add_short_action() {
+    case "$1" in
+        a) ACTIONS+=("Auto updates:configure_auto_updates") ;;
+        b) ACTIONS+=("Bandwidth guard:configure_bandwidth_limit") ;;
+        c) ACTIONS+=("CPU guard:configure_cpu_shutdown") ;;
+        d) ACTIONS+=("Traffic spike guard:configure_ddos_shutdown") ;;
+        f) ACTIONS+=("Fail2ban:configure_fail2ban") ;;
+        i) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
+        s) ACTIONS+=("SSH security:configure_ssh_security") ;;
+        t) ACTIONS+=("System tuning:apply_system_tuning") ;;
+        x) ACTIONS+=("BBRx:install_bbrx") ;;
+        Y) ACTIONS+=("BBRy:install_bbry") ;;
+        z) ACTIONS+=("BBRz:install_bbrz") ;;
+        3) ACTIONS+=("BBRv3:install_bbrv3") ;;
+        h) usage; exit 0 ;;
+        *) error "Invalid option: -$1"; usage; exit 1 ;;
+    esac
+}
+
+parse_args() {
+    if [[ "$#" -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -a|--auto-updates) ACTIONS+=("Auto updates:configure_auto_updates") ;;
+            -b|--bandwidth-limit) ACTIONS+=("Bandwidth guard:configure_bandwidth_limit") ;;
+            -c|--cpu-shutdown) ACTIONS+=("CPU guard:configure_cpu_shutdown") ;;
+            -d|--ddos-shutdown) ACTIONS+=("Traffic spike guard:configure_ddos_shutdown") ;;
+            -f|--fail2ban) ACTIONS+=("Fail2ban:configure_fail2ban") ;;
+            -i|--disk-scheduler) ACTIONS+=("Disk scheduler:configure_disk_scheduler") ;;
+            -s|--ssh-security) ACTIONS+=("SSH security:configure_ssh_security") ;;
+            -t|--tune) ACTIONS+=("System tuning:apply_system_tuning") ;;
+            -x|--bbrx) ACTIONS+=("BBRx:install_bbrx") ;;
+            -Y|--bbry) ACTIONS+=("BBRy:install_bbry") ;;
+            -z|--bbrz) ACTIONS+=("BBRz:install_bbrz") ;;
+            -3|--bbrv3) ACTIONS+=("BBRv3:install_bbrv3") ;;
+            --lang)
+                shift
+                if [[ "$#" -eq 0 ]]; then
+                    error "Missing value for --lang. Use en or zh-CN."
+                    usage
+                    exit 1
+                fi
+                set_language "$1" || { usage; exit 1; }
+                ;;
+            --lang=*) set_language "${1#*=}" || { usage; exit 1; } ;;
+            --zh|--zh-cn|--zh-CN) set_language zh-CN ;;
+            --en|--english) set_language en ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            --dry-run) DRY_RUN=1 ;;
+            --allow-older-bbrv3-kernel) ALLOW_OLDER_BBRV3_KERNEL=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            --) shift; break ;;
+            -*)
+                if [[ "$1" =~ ^-[abcdfisthxYz3]+$ && "${#1}" -gt 2 ]]; then
+                    local chars="${1#-}"
+                    local i
+                    for ((i=0; i<${#chars}; i++)); do
+                        add_short_action "${chars:i:1}"
+                    done
+                else
+                    error "Invalid option: $1"
+                    usage
+                    exit 1
+                fi
+                ;;
+            *)
+                error "Unexpected argument: $1"
+                usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    if [[ "${#ACTIONS[@]}" -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    local bbr_action_count=0 entry
+    for entry in "${ACTIONS[@]}"; do
+        case "${entry%%:*}" in
+            BBRx|BBRy|BBRz|BBRv3) ((bbr_action_count += 1)) ;;
+        esac
+    done
+    if (( bbr_action_count > 1 )); then
+        error "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run."
+        usage
+        exit 1
+    fi
+}
+
+print_summary() {
+    if [[ "$VERBOSE" -ne 1 ]]; then
+        if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+            printf '日志：%s\n' "$RUN_LOG"
+        else
+            printf 'Log: %s\n' "$RUN_LOG"
+        fi
+        return 0
+    fi
+
+    separator
+    say "$C_BOLD" "$(tr_text "Run summary")"
+    if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+        printf '主日志：%s\n\n' "$RUN_LOG"
+    else
+        printf 'Main log: %s\n\n' "$RUN_LOG"
+    fi
+
+    local i result_color result_text label_text
+    for i in "${!SUMMARY_LABELS[@]}"; do
+        if [[ "${SUMMARY_RESULTS[$i]}" == "SUCCESS" ]]; then
+            result_color="$C_OK"
+        else
+            result_color="$C_ERR"
+        fi
+        result_text="$(tr_text "${SUMMARY_RESULTS[$i]}")"
+        label_text="$(tr_text "${SUMMARY_LABELS[$i]}")"
+        printf '%b%-24s%b %s\n' "$result_color" "$result_text" "$C_RESET" "$label_text"
+        if [[ -n "${SUMMARY_LOGS[$i]}" ]]; then
+            if [[ "${LANGUAGE:-en}" == "zh-CN" ]]; then
+                printf '  日志：%s\n' "${SUMMARY_LOGS[$i]}"
+            else
+                printf '  Logs: %s\n' "${SUMMARY_LOGS[$i]}"
+            fi
+        fi
+    done
+}
+
 main() {
-	sysinfo_
-	update_
-	clear
-	while getopts "abcdstfyzx3hi" opt; do
-	case ${opt} in
-		a )
-		seperator
-			info "自动更新"
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			auto_update_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				auto_update_success=1
-			else
-				auto_update_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $auto_update_success -eq 1 ]; then
-				info "自动更新设置成功"
-			else
-				fail "自动更新设置失败"
-			fi
-			;;
-		b )
-			seperator
-			# Set the bandwidth threshold in GB
-			info "设置每月带宽上限"
-			info_2 "输入每月带宽上传上限 （以GB为单位）："
-			read upload_threshold
-			while true
-			do
-				if ! [[ "$upload_threshold" =~ ^[0-9]+$ ]]; then
-					fail "请输入数字"
-					info_2 "输入每月带宽上限 （以GB为单位）："
-					read upload_threshold
-				else
-					break
-				fi
-			done
-			info_2 "输入每月带宽下载上限 （以GB为单位）："
-			read download_threshold
-			while true
-			do
-				if ! [[ "$download_threshold" =~ ^[0-9]+$ ]]; then
-					fail "请输入数字"
-					info_2 "输入每月带宽下载上限 （以GB为单位）："
-					read download_threshold
-				else
-					break
-				fi
-			done
-			# Set the bandwidth reset day
-			info_2 "输入带宽刷新日 (01-31): " 
-			read reset_day
-			while true
-			do
-				if ! [[ $reset_day =~ ^[0-9]{1,2}$ ]] || [ $reset_day -lt 1 ] || [ $reset_day -gt 31 ]; then
-					fail "请输入01-31之间的数字"
-					info_2 "输入带宽刷新日 (01-31): " 
-					read reset_day
-				else
-					break
-				fi
-			done
-			# Add leading zero if necessary
-			reset_day=$(printf "%02d" $reset_day)
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			bandwidth_limit_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				bandwidth_limit_success=1
-			else
-				bandwidth_limit_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $bandwidth_limit_success -eq 1 ]; then
-				info "每月带宽上限设置成功"
-			else
-				fail "每月带宽上限设置失败"
-			fi
-			;;
-		c )
-			seperator
-			info "CPU滥用关机"
-			info_2 "输入CPU滥用阈值 (0-100%):"
-			read cpu_limit
-			while true
-			do
-				if ! [[ "$cpu_limit" =~ ^[0-9]+$ ]]; then
-					fail "请输入数字"
-					info_2 "输入CPU滥用阈值 (0-100%):"
-					read cpu_limit
-				else
-					break
-				fi
-			done
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			cpu_abuse_shutdown_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				cpu_shutdown_success=1
-			else
-				cpu_shutdown_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $cpu_shutdown_success -eq 1 ]; then
-				info "CPU滥用关机设置成功"
-			else
-				fail "CPU滥用关机设置失败"
-			fi
-			;;
+    set_language "$LANGUAGE" || exit 1
+    preparse_language "$@" || exit 1
+    parse_args "$@"
+    require_root
+    mkdir -p "$LOG_DIR"
+    chmod 0700 "$LOG_DIR"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+        mkdir -p "$CONFIG_DIR" "$BIN_DIR"
+        chmod 0755 "$CONFIG_DIR" "$BIN_DIR"
+    fi
+    touch "$RUN_LOG"
+    chmod 0600 "$RUN_LOG"
 
-		d )
-			seperator
-			info "DDoS 自动关机"
-			info_2 "输入DDoS攻击阈值 (Mbps):"
-			read speed_limit
-			while true
-			do
-				if ! [[ "$speed_limit" =~ ^[0-9]+$ ]]; then
-					fail "请输入数字"
-					info_2 "输入DDoS攻击阈值 (Mbps):"
-					read speed_limit
-				else
-					break
-				fi
-			done
-			
-			info_2 "输入DDoS攻击阈值 (pps):"
-			read packet_limit
-			while true
-			do
-				if ! [[ "$packet_limit" =~ ^[0-9]+$ ]]; then
-					fail "请输入数字"
-					info_2 "输入DDoS攻击阈值 (pps):"
-					read packet_limit
-				else
-					break
-				fi
-			done
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			ddos_shutdown_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				ddos_shutdown_success=1
-			else
-				ddos_shutdown_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $ddos_shutdown_success -eq 1 ]; then
-				info "DDoS 自动关机设置成功"
-			else
-				fail "DDoS 自动关机设置失败"
-			fi
-			;;
-		s )
-			seperator
-			info "SSH登录安全設定"
-			ssh_secure_
-			if [ $? -eq 0 ]; then
-				ssh_secure_success=1
-			else
-				ssh_secure_success=0
-			fi
-			if [ $ssh_secure_success -eq 1 ]; then
-				info "SSH登录安全設定成功"
-			else
-				fail "SSH登录安全設定失败"
-			fi
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			fail2ban_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				fail2ban_success=1
-			else
-				fail2ban_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $fail2ban_success -eq 1 ]; then
-				info "Fail2ban安装成功"
-			else
-				fail "Fail2ban安装失败"
-			fi
-			;;
-		f )
-			seperator
-			info "安装Fail2ban"
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			fail2ban_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				fail2ban_success=1
-			else
-				fail2ban_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $fail2ban_success -eq 1 ]; then
-				info "Fail2ban安装成功"
-			else
-				fail "Fail2ban安装失败"
-			fi
-			;;
-		t )
-			seperator
-			info "调整系统参数"
-			BLA::start_loading_animation "${BLA_classic[@]}"
-			tune_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				tune_success=1
-			else
-				tune_success=0
-			fi
-			BLA::stop_loading_animation
-			if [ $tune_success -eq 1 ]; then
-				info "系统参数调整成功"
-			else
-				fail "系统参数调整失败"
-			fi
-			;;
-		x )
-			seperator
-			info "安装BBRx"
-			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
-				fail "不支持LXC"
-				exit 1
-			fi
-			#Only support Debian and Ubuntu
-			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-				BLA::start_loading_animation "${BLA_classic[@]}"
-				install_bbrx_ &> /dev/null
-				if [ $? -eq 0 ]; then
-					bbrx_success=1
-				else
-					bbrx_success=0
-				fi
-				BLA::stop_loading_animation
-				if [ $bbrx_success -eq 1 ]; then
-					info "重启系统以启用BBRx"
-				else
-					fail "BBRx安装失败"
-				fi
-			else
-				fail "不支持此系统"
-			fi
-			;;
-		y )
-			seperator
-			info "安装BBRy"
-			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
-				fail "不支持LXC"
-				exit 1
-			fi
-			#Only support Debian and Ubuntu
-			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-				BLA::start_loading_animation "${BLA_classic[@]}"
-				install_bbry_ &> /dev/null
-				if [ $? -eq 0 ]; then
-					bbry_success=1
-				else
-					bbry_success=0
-				fi
-				BLA::stop_loading_animation
-				if [ $bbry_success -eq 1 ]; then
-					info "重启系统以启用BBRy"
-				else
-					fail "BBRy安装失败"
-				fi
-			else
-				fail "不支持此系统"
-			fi
-			;;
-		z )
-			seperator
-			info "安装BBRz"
-			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
-				fail "不支持LXC"
-				exit 1
-			fi
-			#Only support Debian and Ubuntu
-			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-				BLA::start_loading_animation "${BLA_classic[@]}"
-				install_bbrz_ &> /dev/null
-				if [ $? -eq 0 ]; then
-					bbrz_success=1
-				else
-					bbrz_success=0
-				fi
-				BLA::stop_loading_animation
-				if [ $bbrz_success -eq 1 ]; then
-					info "重启系统以启用BBRz"
-				else
-					fail "BBRz安装失败"
-				fi
-			else
-				fail "不支持此系统"
-			fi
-			;;
-		3 )
-			seperator
-			info "安装BBRv3"
-			if [[ "$virt_tech" =~ "LXC" ]] || [[ "$virt_tech" =~ "lxc" ]]; then
-				fail "不支持LXC"
-				exit 1
-			fi
-			#Only support Debian and Ubuntu
-			if [[ $os =~ "Ubuntu" ]] || [[ $os =~ "Debian" ]]; then
-				BLA::start_loading_animation "${BLA_classic[@]}"
-				install_bbrv3_ &> /dev/null
-				if [ $? -eq 0 ]; then
-					bbrv3_success=1
-				else
-					bbrv3_success=0
-				fi
-				BLA::stop_loading_animation
-				if [ $bbrv3_success -eq 1 ]; then
-					info "重启系统以启用BBRv3"
-				else
-					fail "BBRv3安装失败"
-				fi
-			else
-				fail "不支持此系统"
-			fi
-			;;
-		i )
-			seperator
-			info "设置磁盘IO调度器，HDD设置为mq-deadline，SSD设置为kyber"
-			set_disk_scheduler_udev_ &> /dev/null
-			if [ $? -eq 0 ]; then
-				info "磁盘IO调度器设置成功"
-			else
-				fail "磁盘IO调度器设置失败"
-			fi
-			;;
-		h )
-			info "用法： ./tune.sh [选项]"
-			info "选项："
-			info "  -b  设置每月带库上限"
-			info "  -d  DDoS 自动关机"
-			info "  -s  SSH登录安全設定"
-			info "  -f  仅安装Fail2ban"
-			info "  -t  调整系统参数"
-			info "  -x  安装BBRx(备选方案)"
-			info "  -y  安装BBRy(普通服务器推荐)"
-			info "  -z  安装BBRz(刷流推荐)"
-			info "  -3  安装BBRv3"
-			info "  -i  设置磁盘IO调度器"
-			info "  -h  显示此帮助信息"
-			exit 0
-			;;
-		\? )
-			info "Invalid Option: -$OPTARG" 1>&2
-			exit 1
-			;;
-	esac
+    info "Starting ${SCRIPT_NAME}. Main log: ${RUN_LOG}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        warn "Dry-run mode is enabled; commands are logged but not executed."
+    fi
 
-	done
+    detect_system
+
+    local overall=0
+    local entry label function_name
+    for entry in "${ACTIONS[@]}"; do
+        label="${entry%%:*}"
+        function_name="${entry#*:}"
+        if ! run_action "$label" "$function_name"; then
+            overall=1
+        fi
+    done
+
+    print_summary
+    exit "$overall"
 }
 
-# 只在脚本被直接执行时才运行主逻辑
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-	main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
