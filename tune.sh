@@ -1720,6 +1720,75 @@ install_bbrz() {
     install_bbr_dkms bbrz
 }
 
+installed_bbrv3_kernel() {
+    dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*-bbr3*' 2>/dev/null |
+        awk -F '\t' '$1 == "install ok installed" {
+            package=$2
+            sub(/:[^:]+$/, "", package)
+            sub(/^linux-image-/, "", package)
+            print package
+        }' |
+        sort -V |
+        tail -n 1
+}
+
+grub_bbrv3_boot_entry() {
+    local kernel="$1"
+    local grub_config="/boot/grub/grub.cfg"
+    local submenu_id entry_id
+
+    [[ -r "$grub_config" ]] || return 1
+    submenu_id="$(awk -F "'" '
+        /^[[:space:]]*submenu / && $(NF - 1) ~ /^gnulinux-advanced-/ {
+            print $(NF - 1)
+            exit
+        }
+    ' "$grub_config")"
+    entry_id="$(awk -F "'" -v needle="with Linux ${kernel}" '
+        /^[[:space:]]*menuentry / && index($0, needle) && !index($0, "(recovery mode)") {
+            print $(NF - 1)
+            exit
+        }
+    ' "$grub_config")"
+    [[ -n "$entry_id" ]] || return 1
+
+    if [[ -n "$submenu_id" ]]; then
+        printf '%s>%s\n' "$submenu_id" "$entry_id"
+    else
+        printf '%s\n' "$entry_id"
+    fi
+}
+
+verify_grub_next_entry() {
+    local expected="$1" actual
+    actual="$(grub-editenv list 2>/dev/null | sed -n 's/^next_entry=//p')"
+    [[ "$actual" == "$expected" ]]
+}
+
+schedule_bbrv3_next_boot() {
+    local kernel selection
+
+    if ! command_exists grub-reboot || ! command_exists grub-editenv; then
+        error "grub-reboot and grub-editenv are required to select the BBRv3 kernel safely."
+        return 1
+    fi
+
+    kernel="$(installed_bbrv3_kernel || true)"
+    if [[ -z "$kernel" || ! -s "/boot/vmlinuz-${kernel}" ]]; then
+        error "No installed BBRv3 kernel package was found after the installer completed."
+        return 1
+    fi
+    selection="$(grub_bbrv3_boot_entry "$kernel" || true)"
+    if [[ -z "$selection" ]]; then
+        error "The GRUB menu entry for ${kernel} was not found."
+        return 1
+    fi
+
+    run_cmd "Set one-time GRUB boot entry for ${kernel}" grub-reboot "$selection" || return 1
+    run_cmd "Verify one-time GRUB boot entry for ${kernel}" verify_grub_next_entry "$selection" || return 1
+    success "Scheduled ${kernel} for the next boot only; the persistent GRUB default was not changed."
+}
+
 install_bbrv3() {
     local installer lang_code="en" rc=0
     local -a installer_cmd=()
@@ -1762,7 +1831,12 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF_BBRV3_SYSCTL
     sync_tune_sysctl_for_bbr bbr || return 1
-    success "BBRv3 installer completed; reboot was not scheduled."
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "DRY-RUN: would select the installed BBRv3 kernel for the next boot only."
+    else
+        schedule_bbrv3_next_boot || return 1
+    fi
+    success "BBRv3 installer completed; a one-time BBRv3 boot was selected, but reboot was not scheduled."
 }
 
 configure_ssh_security() {

@@ -99,6 +99,8 @@ BBRx、BBRy 和 BBRz 源码固定在 `guowanghushifu/Seedbox-Components` 提交 
 
 BBRv3 使用 `jerry048/Dedicated-Seedbox` 安装器提交 `97470df47a948b0f39082e7679c630eaeff438d1`，安装器脚本本身也有固定 SHA-256。该安装器当前从持续变化的 `jerry048/Trove` `main` 分支获取内核包，但会先下载 `SHA256SUMS` 清单并校验选中的包。高级用户可使用 `TUNE_BBRV3_RAW_BASE` 覆盖该 payload 基址。
 
+安装完成后，Tune 会在生成的 GRUB 菜单中定位已安装的 BBRv3 内核，并用 `grub-reboot` 只选择下一次启动项。它不会修改永久 GRUB 默认项，也不会自动重启。当发行版内核版本号更高、原本会继续作为默认项时，这一步尤其必要；一次性进入 BBRv3 后，后续再次重启会回到发行版默认项，除非重新选择 BBRv3。
+
 每次运行只能选择一个 BBR 变体。在生产 seedbox 上使用前，必须先在与生产环境的系统、架构和内核一致的一次性虚拟机中验证。某个内核上 DKMS 构建成功，不代表其他内核也兼容。
 
 示例：
@@ -187,7 +189,7 @@ sysctl net.ipv4.tcp_available_congestion_control net.ipv4.tcp_congestion_control
 /usr/src/{bbrx,bbry,bbrz}-1.0.0.802fada/
 ```
 
-BBRv3 安装器另外管理 `/etc/sysctl.d/90-bbr-congestion-control.conf`。Tune 会使 `/etc/sysctl.d/90-tune.conf` 与当前选中的 BBR 变体保持一致，避免后续 sysctl 加载顺序悄然覆盖它。
+BBRv3 安装器另外管理 `/etc/sysctl.d/90-bbr-congestion-control.conf`；使用 GRUB 时，Tune 还会向 `/boot/grub/grubenv` 写入一次性 `next_entry`。Tune 会使 `/etc/sysctl.d/90-tune.conf` 与当前选中的 BBR 变体保持一致，避免后续 sysctl 加载顺序悄然覆盖它。
 
 需要直接修改的现有文件会在适用时备份为 `.bak.<run-id>` 后缀。
 

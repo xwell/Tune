@@ -73,6 +73,8 @@ BBRx, BBRy, and BBRz sources are pinned to `guowanghushifu/Seedbox-Components` c
 
 BBRv3 uses `jerry048/Dedicated-Seedbox` installer commit `97470df47a948b0f39082e7679c630eaeff438d1`, whose script SHA-256 is also pinned. That installer currently obtains kernel packages from the moving `jerry048/Trove` `main` branch, but downloads its `SHA256SUMS` manifest first and verifies the selected packages. Advanced users can override that payload base with `TUNE_BBRV3_RAW_BASE`.
 
+After installation, Tune locates the installed BBRv3 kernel in the generated GRUB menu and uses `grub-reboot` to select it for the next boot only. It does not change the persistent GRUB default and does not reboot automatically. This matters when the distro kernel has a numerically higher version and would otherwise remain the default; after the one-time BBRv3 boot, a later reboot falls back to the distro default unless BBRv3 is selected again.
+
 Only one BBR variant may be selected per run. Test every BBR action on a disposable VM that matches the production OS, architecture, and kernel before using it on a production seedbox; a DKMS build succeeding on one kernel does not establish compatibility with another.
 
 Examples:
@@ -161,7 +163,7 @@ Depending on selected actions, the script may create or update:
 /usr/src/{bbrx,bbry,bbrz}-1.0.0.802fada/
 ```
 
-The BBRv3 installer additionally manages `/etc/sysctl.d/90-bbr-congestion-control.conf`. Tune keeps `/etc/sysctl.d/90-tune.conf` aligned with the selected BBR variant so later sysctl load order does not silently override it.
+The BBRv3 installer additionally manages `/etc/sysctl.d/90-bbr-congestion-control.conf`, and Tune writes a one-time `next_entry` to `/boot/grub/grubenv` when GRUB is available. Tune keeps `/etc/sysctl.d/90-tune.conf` aligned with the selected BBR variant so later sysctl load order does not silently override it.
 
 Existing files that need direct modification are backed up with a `.bak.<run-id>` suffix where applicable.
 
