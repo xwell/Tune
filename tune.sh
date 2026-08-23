@@ -154,6 +154,7 @@ tr_text() {
     if [[ "$text" =~ ^Initialize\ vnStat\ database\ for\ (.*)$ ]]; then printf '初始化 %s 的 vnStat 数据库' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Set\ RX\ ring\ buffer\ on\ (.*)$ ]]; then printf '设置 %s 的 RX 环形缓冲区' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Set\ TX\ ring\ buffer\ on\ (.*)$ ]]; then printf '设置 %s 的 TX 环形缓冲区' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^Ring\ buffer\ target\ for\ (.*):\ ([0-9]+)\ \(RX\ ([0-9]+)/([0-9]+),\ TX\ ([0-9]+)/([0-9]+)\)$ ]]; then printf '%s 的环形缓冲区目标：%s（RX %s/%s，TX %s/%s）' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"; return 0; fi
     if [[ "$text" =~ ^Disable\ TSO/GSO/GRO\ offloads\ on\ (.*)$ ]]; then printf '关闭 %s 的 TSO/GSO/GRO 卸载' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Set\ txqueuelen\ on\ (.*)$ ]]; then printf '设置 %s 的 txqueuelen' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^Apply\ sysctl\ tuning\ from\ (.*)$ ]]; then printf '应用来自 %s 的 sysctl 调优' "${BASH_REMATCH[1]}"; return 0; fi
@@ -214,6 +215,7 @@ tr_text() {
         "Password authentication left enabled.") printf '已保留密码认证。' ;;
         "RX ring tuning skipped; unsupported by this NIC/driver.") printf '已跳过 RX 环形缓冲区调优；此网卡/驱动不支持。' ;;
         "TX ring tuning skipped; unsupported by this NIC/driver.") printf '已跳过 TX 环形缓冲区调优；此网卡/驱动不支持。' ;;
+        "Ring buffer tuning skipped because link speed or hardware maxima could not be read safely.") printf '无法可靠读取链路速率或硬件上限，已跳过环形缓冲区调优。' ;;
         "Offload tuning skipped; unsupported by this NIC/driver/hypervisor.") printf '已跳过卸载调优；此网卡/驱动/虚拟化环境不支持。' ;;
         "txqueuelen tuning skipped.") printf '已跳过 txqueuelen 调优。' ;;
         "Initial congestion window tuning skipped.") printf '已跳过初始拥塞窗口调优。' ;;
@@ -1736,6 +1738,95 @@ EOF_SYSTEMD_LIMITS
     success "Wrote ${SYSTEMD_LIMITS_FILE}. A reboot or systemd daemon-reexec is required for manager-wide defaults."
 }
 
+ring_buffer_values() {
+    local iface="$1"
+    local speed ring_info max_values rx_max tx_max target rx_target tx_target
+
+    speed="$(ethtool "$iface" 2>/dev/null | awk -F': *' '
+        /^[[:space:]]*Speed:/ {
+            value=$2
+            sub(/Mb\/s.*/, "", value)
+            gsub(/[[:space:]]/, "", value)
+            if (value ~ /^[0-9]+$/) print value
+            exit
+        }
+    ')"
+    [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )) || return 1
+
+    ring_info="$(ethtool -g "$iface" 2>/dev/null)" || return 1
+    max_values="$(awk '
+        /Pre-set maximums:/ { section="max"; next }
+        /Current hardware settings:/ { section="current"; next }
+        section == "max" && $1 == "RX:" && $2 ~ /^[0-9]+$/ { rx=$2 }
+        section == "max" && $1 == "TX:" && $2 ~ /^[0-9]+$/ { tx=$2 }
+        END {
+            if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) print rx "\t" tx
+            else exit 1
+        }
+    ' <<< "$ring_info")" || return 1
+    IFS=$'\t' read -r rx_max tx_max <<< "$max_values"
+
+    if (( speed <= 1000 )); then
+        target=1024
+    elif (( speed <= 10000 )); then
+        target=4096
+    else
+        target=8192
+    fi
+
+    rx_target=$(( rx_max < target ? rx_max : target ))
+    tx_target=$(( tx_max < target ? tx_max : target ))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$rx_target" "$tx_target" "$rx_max" "$tx_max"
+}
+
+set_initial_congestion_window() {
+    local route gateway="" device="" proto="" src="" metric="" updated
+    local -a fields=() route_cmd=(ip route change default)
+    local i
+
+    route="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    if [[ -z "$route" ]]; then
+        printf '%s\n' "No IPv4 default route was found." >&2
+        return 1
+    fi
+
+    IFS=' ' read -r -a fields <<< "$route"
+    for ((i=0; i<${#fields[@]}; i++)); do
+        (( i + 1 < ${#fields[@]} )) || continue
+        case "${fields[$i]}" in
+            via) gateway="${fields[$((i + 1))]}" ;;
+            dev) device="${fields[$((i + 1))]}" ;;
+            proto) proto="${fields[$((i + 1))]}" ;;
+            src) src="${fields[$((i + 1))]}" ;;
+            metric) metric="${fields[$((i + 1))]}" ;;
+        esac
+    done
+
+    if [[ -z "$device" ]] || ! validate_iface_name "$device" || ! ip link show dev "$device" >/dev/null 2>&1; then
+        printf '%s\n' "The default-route network device is missing or invalid: ${device:-unknown}." >&2
+        return 1
+    fi
+    if [[ -n "$metric" && ! "$metric" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "The default-route metric is invalid: ${metric}." >&2
+        return 1
+    fi
+
+    [[ -n "$gateway" ]] && route_cmd+=(via "$gateway")
+    route_cmd+=(dev "$device")
+    [[ -n "$proto" ]] && route_cmd+=(proto "$proto")
+    [[ -n "$src" ]] && route_cmd+=(src "$src")
+    [[ -n "$metric" ]] && route_cmd+=(metric "$metric")
+    route_cmd+=(initcwnd 100 initrwnd 100)
+
+    "${route_cmd[@]}" || return 1
+
+    updated="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    if [[ " $updated " != *" initcwnd 100 "* || " $updated " != *" initrwnd 100 "* ]]; then
+        printf '%s\n' "The default route did not retain initcwnd/initrwnd 100 after the change." >&2
+        return 1
+    fi
+}
+
 write_netdev_boot_helper() {
     write_file "${BIN_DIR}/tune-boot-apply" 0755 <<'EOF_NETDEV'
 #!/usr/bin/env bash
@@ -1769,6 +1860,82 @@ virt_kind() {
     fi
 }
 
+ring_buffer_values() {
+    local target_iface="$1"
+    local speed ring_info max_values rx_max tx_max target rx_target tx_target
+
+    speed="$(ethtool "$target_iface" 2>/dev/null | awk -F': *' '
+        /^[[:space:]]*Speed:/ {
+            value=$2
+            sub(/Mb\/s.*/, "", value)
+            gsub(/[[:space:]]/, "", value)
+            if (value ~ /^[0-9]+$/) print value
+            exit
+        }
+    ')"
+    [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )) || return 1
+
+    ring_info="$(ethtool -g "$target_iface" 2>/dev/null)" || return 1
+    max_values="$(awk '
+        /Pre-set maximums:/ { section="max"; next }
+        /Current hardware settings:/ { section="current"; next }
+        section == "max" && $1 == "RX:" && $2 ~ /^[0-9]+$/ { rx=$2 }
+        section == "max" && $1 == "TX:" && $2 ~ /^[0-9]+$/ { tx=$2 }
+        END {
+            if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/) print rx "\t" tx
+            else exit 1
+        }
+    ' <<< "$ring_info")" || return 1
+    IFS=$'\t' read -r rx_max tx_max <<< "$max_values"
+
+    if (( speed <= 1000 )); then
+        target=1024
+    elif (( speed <= 10000 )); then
+        target=4096
+    else
+        target=8192
+    fi
+
+    rx_target=$(( rx_max < target ? rx_max : target ))
+    tx_target=$(( tx_max < target ? tx_max : target ))
+    printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$rx_target" "$tx_target" "$rx_max" "$tx_max"
+}
+
+set_initial_congestion_window() {
+    local route gateway="" device="" proto="" src="" metric="" updated
+    local -a fields=() route_cmd=(ip route change default)
+    local i
+
+    route="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    [[ -n "$route" ]] || return 1
+    IFS=' ' read -r -a fields <<< "$route"
+    for ((i=0; i<${#fields[@]}; i++)); do
+        (( i + 1 < ${#fields[@]} )) || continue
+        case "${fields[$i]}" in
+            via) gateway="${fields[$((i + 1))]}" ;;
+            dev) device="${fields[$((i + 1))]}" ;;
+            proto) proto="${fields[$((i + 1))]}" ;;
+            src) src="${fields[$((i + 1))]}" ;;
+            metric) metric="${fields[$((i + 1))]}" ;;
+        esac
+    done
+
+    [[ -n "$device" && "$device" =~ ^[A-Za-z0-9_.:@-]+$ ]] || return 1
+    ip link show dev "$device" >/dev/null 2>&1 || return 1
+    [[ -z "$metric" || "$metric" =~ ^[0-9]+$ ]] || return 1
+
+    [[ -n "$gateway" ]] && route_cmd+=(via "$gateway")
+    route_cmd+=(dev "$device")
+    [[ -n "$proto" ]] && route_cmd+=(proto "$proto")
+    [[ -n "$src" ]] && route_cmd+=(src "$src")
+    [[ -n "$metric" ]] && route_cmd+=(metric "$metric")
+    route_cmd+=(initcwnd 100 initrwnd 100)
+    "${route_cmd[@]}" || return 1
+
+    updated="$(ip -o -4 route show default 2>/dev/null | sed -n '1p')"
+    [[ " $updated " == *" initcwnd 100 "* && " $updated " == *" initrwnd 100 "* ]]
+}
+
 iface="$(primary_iface)"
 if [[ -z "$iface" ]]; then
     log_msg warning "No default-route network interface detected."
@@ -1779,8 +1946,17 @@ kind="$(virt_kind)"
 
 if command -v ethtool >/dev/null 2>&1; then
     if [[ "$kind" == "none" ]]; then
-        ethtool -G "$iface" rx 1024 >/dev/null 2>&1 || log_msg warning "Could not set RX ring buffer on ${iface}; driver may not support it."
-        ethtool -G "$iface" tx 2048 >/dev/null 2>&1 || log_msg warning "Could not set TX ring buffer on ${iface}; driver may not support it."
+        if IFS=$'\t' read -r ring_target rx_target tx_target rx_max tx_max < <(ring_buffer_values "$iface"); then
+            log_msg info "${iface}: ring target=${ring_target}, RX=${rx_target}/${rx_max}, TX=${tx_target}/${tx_max}."
+            if (( rx_target > 0 )); then
+                ethtool -G "$iface" rx "$rx_target" >/dev/null 2>&1 || log_msg warning "Could not set RX ring buffer on ${iface}; driver may not support it."
+            fi
+            if (( tx_target > 0 )); then
+                ethtool -G "$iface" tx "$tx_target" >/dev/null 2>&1 || log_msg warning "Could not set TX ring buffer on ${iface}; driver may not support it."
+            fi
+        else
+            log_msg warning "Could not safely read link speed and ring-buffer maxima for ${iface}; ring tuning was skipped."
+        fi
     else
         ethtool -K "$iface" tso off gso off gro off >/dev/null 2>&1 || log_msg warning "Could not disable offloads on ${iface}; hypervisor/driver may not support it."
     fi
@@ -1788,12 +1964,7 @@ fi
 
 if [[ "$kind" != "container" ]]; then
     ip link set dev "$iface" txqueuelen 10000 >/dev/null 2>&1 || log_msg warning "Could not set txqueuelen on ${iface}."
-    default_route="$(ip -o -4 route show to default | head -n 1 || true)"
-    if [[ -n "$default_route" ]]; then
-        # The route may already contain metrics/options. Preserve the route and add init windows.
-        IFS=' ' read -r -a route_parts <<< "$default_route"
-        ip route change "${route_parts[@]}" initcwnd 100 initrwnd 100 >/dev/null 2>&1 || log_msg warning "Could not set initial congestion window on default route."
-    fi
+    set_initial_congestion_window >/dev/null 2>&1 || log_msg warning "Could not set and verify the initial congestion window on the IPv4 default route."
 fi
 EOF_NETDEV
 
@@ -1828,16 +1999,25 @@ apply_netdev_tuning_now() {
     ensure_packages ethtool || return 1
 
     if [[ "$VIRT_KIND" == "none" ]]; then
-        run_cmd "Set RX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" rx 1024 || warn "RX ring tuning skipped; unsupported by this NIC/driver."
-        run_cmd "Set TX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" tx 2048 || warn "TX ring tuning skipped; unsupported by this NIC/driver."
+        local ring_target rx_target tx_target rx_max tx_max
+        if IFS=$'\t' read -r ring_target rx_target tx_target rx_max tx_max < <(ring_buffer_values "$PRIMARY_IFACE"); then
+            info "Ring buffer target for ${PRIMARY_IFACE}: ${ring_target} (RX ${rx_target}/${rx_max}, TX ${tx_target}/${tx_max})"
+            if (( rx_target > 0 )); then
+                run_cmd "Set RX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" rx "$rx_target" || warn "RX ring tuning skipped; unsupported by this NIC/driver."
+            fi
+            if (( tx_target > 0 )); then
+                run_cmd "Set TX ring buffer on ${PRIMARY_IFACE}" ethtool -G "$PRIMARY_IFACE" tx "$tx_target" || warn "TX ring tuning skipped; unsupported by this NIC/driver."
+            fi
+        else
+            warn "Ring buffer tuning skipped because link speed or hardware maxima could not be read safely."
+        fi
     else
         run_cmd "Disable TSO/GSO/GRO offloads on ${PRIMARY_IFACE}" ethtool -K "$PRIMARY_IFACE" tso off gso off gro off || warn "Offload tuning skipped; unsupported by this NIC/driver/hypervisor."
     fi
 
     if [[ "$VIRT_KIND" != "container" ]]; then
         run_cmd "Set txqueuelen on ${PRIMARY_IFACE}" ip link set dev "$PRIMARY_IFACE" txqueuelen 10000 || warn "txqueuelen tuning skipped."
-        run_shell "Set initial congestion window on default route" \
-            'route="$(ip -o -4 route show to default | head -n 1 || true)"; if [[ -n "$route" ]]; then IFS=" " read -r -a route_parts <<< "$route"; ip route change "${route_parts[@]}" initcwnd 100 initrwnd 100 || true; fi' || warn "Initial congestion window tuning skipped."
+        run_cmd "Set initial congestion window on default route" set_initial_congestion_window || warn "Initial congestion window tuning skipped."
     else
         warn "Container detected; skipping link queue and route tuning."
     fi
