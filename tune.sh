@@ -33,10 +33,14 @@ readonly BBR_MODULES_FILE="/etc/modules-load.d/90-tune-bbr.conf"
 readonly BBRV3_INSTALLER_COMMIT="97470df47a948b0f39082e7679c630eaeff438d1"
 readonly BBRV3_INSTALLER_URL="https://raw.githubusercontent.com/jerry048/Dedicated-Seedbox/${BBRV3_INSTALLER_COMMIT}/lib/components/bbr/BBRInstall.sh"
 readonly BBRV3_INSTALLER_SHA256="9b8c099c90d5707bdeae57b460b525865d55981c2f37c1814257a30a130cbe8f"
+readonly BBRV3_PAYLOAD_COMMIT="8131d4b005c20ae1d73be545b1c5d8ebc435ad1d"
+readonly BBRV3_PAYLOAD_BASE="https://raw.githubusercontent.com/jerry048/Trove/${BBRV3_PAYLOAD_COMMIT}/BBR-Install/BBR"
+readonly BBRV3_PAYLOAD_KERNEL_VERSION="6.13.7"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_LOG="${LOG_DIR}/${RUN_ID}.log"
 ASSUME_YES=0
+ALLOW_OLDER_BBRV3_KERNEL=0
 DRY_RUN=0
 VERBOSE=0
 LANGUAGE="${TUNE_LANG:-en}"
@@ -171,6 +175,9 @@ tr_text() {
     if [[ "$text" =~ ^Check\ fail2ban\ status$ ]]; then printf '检查 fail2ban 状态'; return 0; fi
     if [[ "$text" =~ ^Container\ detected\ \((.*)\)\.\ Skipping\ sysctl\ tuning\ because\ many\ kernel\ parameters\ are\ controlled\ by\ the\ host\.$ ]]; then printf '检测到容器（%s）。跳过 sysctl 调优，因为许多内核参数由宿主机控制。' "${BASH_REMATCH[1]}"; return 0; fi
     if [[ "$text" =~ ^BBR\ is\ not\ available\ in\ the\ current\ kernel\;\ keeping\ congestion\ control\ as\ (.*)\.$ ]]; then printf '当前内核不支持 BBR；保持拥塞控制为 %s。' "${BASH_REMATCH[1]}"; return 0; fi
+    if [[ "$text" =~ ^BBRv3\ kernel\ safety\ check:\ distribution\ ([^,]+),\ payload\ (.+)\.$ ]]; then printf 'BBRv3 内核安全检查：发行版 %s，payload %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Refusing\ BBRv3\ because\ payload\ kernel\ ([^[:space:]]+)\ is\ older\ than\ distribution\ kernel\ ([^[:space:]]+)\.$ ]]; then printf '拒绝安装 BBRv3：payload 内核 %s 低于发行版内核 %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
+    if [[ "$text" =~ ^Explicit\ override\ accepted:\ BBRv3\ payload\ kernel\ ([^[:space:]]+)\ is\ older\ than\ distribution\ kernel\ ([^[:space:]]+)\.$ ]]; then printf '已接受显式覆盖：BBRv3 payload 内核 %s 低于发行版内核 %s。' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; return 0; fi
 
     case "$text" in
         "Auto updates") printf '自动安全更新' ;;
@@ -218,6 +225,8 @@ tr_text() {
         "The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause.") printf 'DKMS 模块构建失败。请查看步骤日志中的编译器输出；源码与内核 API 不匹配是可能原因之一。' ;;
         "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
         "Select only one of BBRx, BBRy, BBRz, or BBRv3 per run.") printf '每次运行只能选择 BBRx、BBRy、BBRz 或 BBRv3 中的一个。' ;;
+        "Unable to determine a distribution or running kernel version for the BBRv3 safety check.") printf '无法为 BBRv3 安全检查确定发行版内核或运行内核版本。' ;;
+        "Use --allow-older-bbrv3-kernel to override this safety check explicitly; --yes does not bypass it.") printf '如需显式覆盖此安全检查，请使用 --allow-older-bbrv3-kernel；--yes 不会绕过该检查。' ;;
         "ip command not found. Network-interface actions will fail until iproute2 is installed.") printf '未找到 ip 命令。安装 iproute2 前，网卡相关操作会失败。' ;;
         "This action requires systemd. The current environment does not appear to be booted with systemd.") printf '此操作需要 systemd。当前环境似乎不是由 systemd 启动。' ;;
         "This script must be run as root. Try: sudo ./${SCRIPT_NAME} ...") printf '此脚本必须以 root 身份运行。请尝试：sudo ./${SCRIPT_NAME} ...' ;;
@@ -285,6 +294,8 @@ usage() {
 通用：
   -y, --yes                在安全的 yes/no 确认处默认回答 yes
       --dry-run            预览变更；命令会写入日志但不会执行
+      --allow-older-bbrv3-kernel
+                            允许安装比发行版内核更旧的 BBRv3 payload；--yes 不会隐含此选项
   -v, --verbose            显示步骤进度、命令和生成的文件内容
       --lang <en|zh-CN>    选择输出语言：英文或简体中文
       --zh-cn              等同于 --lang zh-CN
@@ -326,6 +337,8 @@ Actions:
 General:
   -y, --yes                Assume yes for yes/no confirmations where safe
       --dry-run            Preview changes; commands are logged but not executed
+      --allow-older-bbrv3-kernel
+                            Allow an older BBRv3 payload kernel; --yes never implies this
   -v, --verbose            Show step-level progress, commands, and generated file content
       --lang <en|zh-CN>    Display script messages in English or Simplified Chinese
       --zh-cn              Shortcut for --lang zh-CN
@@ -1720,15 +1733,87 @@ install_bbrz() {
     install_bbr_dkms bbrz
 }
 
+kernel_base_version() {
+    local release="$1"
+
+    # Distro ABI and custom-build suffixes are not directly comparable; the
+    # downgrade policy intentionally compares only the upstream x.y.z base.
+    if [[ "$release" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+        printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]:-0}"
+        return 0
+    fi
+    return 1
+}
+
+highest_reference_kernel_version() {
+    local candidate base highest=""
+
+    # The highest installed distro kernel is a conservative proxy for the
+    # persistent boot target, including while a one-shot BBRv3 boot is active.
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        case "${candidate,,}" in
+            *bbr3*|*bbrv3*) continue ;;
+        esac
+        base="$(kernel_base_version "$candidate" || true)"
+        [[ -n "$base" ]] || continue
+        if [[ -z "$highest" ]] || dpkg --compare-versions "$base" gt "$highest"; then
+            highest="$base"
+        fi
+    done < <(
+        uname -r 2>/dev/null || true
+        { dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*' 2>/dev/null || true; } |
+            awk -F '\t' '$1 == "install ok installed" {
+                package=$2
+                sub(/:[^:]+$/, "", package)
+                if (package ~ /^linux-image-unsigned-[0-9]/) {
+                    sub(/^linux-image-unsigned-/, "", package)
+                } else if (package ~ /^linux-image-[0-9]/) {
+                    sub(/^linux-image-/, "", package)
+                } else {
+                    next
+                }
+                print package
+            }'
+    )
+
+    [[ -n "$highest" ]] || return 1
+    printf '%s\n' "$highest"
+}
+
+check_bbrv3_kernel_age() {
+    local reference target="$BBRV3_PAYLOAD_KERNEL_VERSION"
+
+    reference="$(highest_reference_kernel_version || true)"
+    if [[ -z "$reference" ]]; then
+        error "Unable to determine a distribution or running kernel version for the BBRv3 safety check."
+        return 1
+    fi
+
+    notice "BBRv3 kernel safety check: distribution ${reference}, payload ${target}."
+    if ! dpkg --compare-versions "$reference" gt "$target"; then
+        return 0
+    fi
+
+    if [[ "$ALLOW_OLDER_BBRV3_KERNEL" -eq 1 ]]; then
+        warn "Explicit override accepted: BBRv3 payload kernel ${target} is older than distribution kernel ${reference}."
+        return 0
+    fi
+
+    error "Refusing BBRv3 because payload kernel ${target} is older than distribution kernel ${reference}."
+    error "Use --allow-older-bbrv3-kernel to override this safety check explicitly; --yes does not bypass it."
+    return 1
+}
+
 installed_bbrv3_kernel() {
-    dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*-bbr3*' 2>/dev/null |
+    { dpkg-query -W -f='${Status}\t${binary:Package}\n' 'linux-image-*-bbr3*' 'linux-image-*-bbrv3*' 2>/dev/null || true; } |
         awk -F '\t' '$1 == "install ok installed" {
             package=$2
             sub(/:[^:]+$/, "", package)
             sub(/^linux-image-/, "", package)
             print package
         }' |
-        sort -V |
+        sort -Vu |
         tail -n 1
 }
 
@@ -1800,6 +1885,7 @@ install_bbrv3() {
         return 1
     fi
 
+    check_bbrv3_kernel_age || return 1
     ensure_packages curl ca-certificates || return 1
     installer="$(mktemp)"
     [[ "$LANGUAGE" == "zh-CN" ]] && lang_code="zh-TW"
@@ -1813,10 +1899,7 @@ install_bbrv3() {
         return 1
     fi
 
-    installer_cmd=(env "BBR_ALGO=bbrv3" "BBR_LANG=${lang_code}")
-    if [[ -n "${TUNE_BBRV3_RAW_BASE:-}" ]]; then
-        installer_cmd+=("RAW_BASE=${TUNE_BBRV3_RAW_BASE}")
-    fi
+    installer_cmd=(env "BBR_ALGO=bbrv3" "BBR_LANG=${lang_code}" "RAW_BASE=${TUNE_BBRV3_RAW_BASE:-$BBRV3_PAYLOAD_BASE}")
     installer_cmd+=(bash "$installer" --algo bbrv3)
     run_cmd "Run pinned BBRv3 installer" "${installer_cmd[@]}" || rc=$?
     rm -f -- "$installer"
@@ -1826,7 +1909,7 @@ install_bbrv3() {
 
     run_cmd "Remove custom BBR module autoload for BBRv3" rm -f -- "$BBR_MODULES_FILE" || return 1
     write_file "$BBR_SYSCTL_FILE" 0644 <<EOF_BBRV3_SYSCTL
-# Managed by tune.sh. BBRv3 installer commit: ${BBRV3_INSTALLER_COMMIT}.
+# Managed by tune.sh. BBRv3 installer commit: ${BBRV3_INSTALLER_COMMIT}; payload commit: ${BBRV3_PAYLOAD_COMMIT}.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF_BBRV3_SYSCTL
@@ -2550,6 +2633,7 @@ parse_args() {
             --en|--english) set_language en ;;
             -y|--yes) ASSUME_YES=1 ;;
             --dry-run) DRY_RUN=1 ;;
+            --allow-older-bbrv3-kernel) ALLOW_OLDER_BBRV3_KERNEL=1 ;;
             -v|--verbose) VERBOSE=1 ;;
             -h|--help) usage; exit 0 ;;
             --) shift; break ;;
@@ -2666,4 +2750,6 @@ main() {
     exit "$overall"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

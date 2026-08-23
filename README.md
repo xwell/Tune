@@ -46,6 +46,7 @@ sudo ./tune.sh -ts
 |---|---|
 | `-y`, `--yes` | Assume yes for yes/no confirmations where the script considers it safe. |
 | `--dry-run` | Preview changes; commands are logged but not executed. |
+| `--allow-older-bbrv3-kernel` | Explicitly allow a BBRv3 payload older than the highest installed/running non-BBRv3 kernel. `--yes` never implies this option. |
 | `-v`, `--verbose` | Show step-level progress, commands, and generated file content. |
 | `--zh-cn` | Shortcut for `--lang zh-CN`. |
 | `--en` | Shortcut for `--lang en`. |
@@ -67,11 +68,13 @@ sudo ./tune.sh -ts
 | BBRx | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
 | BBRy | Debian or Ubuntu | Attempts a DKMS build against the running kernel; the actual kernel headers/API are the final compatibility check. |
 | BBRz | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
-| BBRv3 | Installer support: Debian 11/12/13 and Ubuntu 22.04/24.04/26.04 on amd64; Debian 13 on arm64 | Installs a prebuilt kernel and requires a reboot into that kernel. |
+| BBRv3 | Installer support: Debian 11/12/13 and Ubuntu 22.04/24.04/26.04 on amd64; Debian 13 on arm64 | Installs the pinned prebuilt 6.13.7 non-LTS kernel and requires a reboot into that kernel. |
 
 BBRx, BBRy, and BBRz sources are pinned to `guowanghushifu/Seedbox-Components` commit `802fada1488bfbb9540a5740082d557aa88f8d6b`. The script verifies a hard-coded SHA-256 before DKMS sees the source, creates its own `Makefile` and `dkms.conf`, loads the module, and verifies both availability and the active congestion-control setting. It does not schedule a reboot.
 
-BBRv3 uses `jerry048/Dedicated-Seedbox` installer commit `97470df47a948b0f39082e7679c630eaeff438d1`, whose script SHA-256 is also pinned. That installer currently obtains kernel packages from the moving `jerry048/Trove` `main` branch, but downloads its `SHA256SUMS` manifest first and verifies the selected packages. Advanced users can override that payload base with `TUNE_BBRV3_RAW_BASE`.
+BBRv3 uses `jerry048/Dedicated-Seedbox` installer commit `97470df47a948b0f39082e7679c630eaeff438d1`, whose script SHA-256 is also pinned. Its kernel payload is pinned separately to `jerry048/Trove` commit `8131d4b005c20ae1d73be545b1c5d8ebc435ad1`; the selected package is verified against that commit's `SHA256SUMS` manifest. `TUNE_BBRV3_RAW_BASE` may point to an exact mirror of this pinned payload. Content containing a different kernel version is unsupported because the safety check assumes the pinned 6.13.7 payload.
+
+Before downloading the installer or changing packages, Tune compares the 6.13.7 payload with the highest numeric kernel version found among the running non-BBRv3 kernel and installed `linux-image-*` packages, excluding BBRv3 packages. If the reference kernel is newer, installation stops. `--yes` cannot bypass this check; an intentional experiment requires the dedicated `--allow-older-bbrv3-kernel` option. Dry-run performs the same read-only check and reports both versions.
 
 After installation, Tune locates the installed BBRv3 kernel in the generated GRUB menu and uses `grub-reboot` to select it for the next boot only. It does not change the persistent GRUB default and does not reboot automatically. This matters when the distro kernel has a numerically higher version and would otherwise remain the default; after the one-time BBRv3 boot, a later reboot falls back to the distro default unless BBRv3 is selected again.
 
@@ -84,6 +87,7 @@ sudo ./tune.sh --dry-run --verbose --bbrx
 sudo ./tune.sh --bbry       # uppercase short form: -Y
 sudo ./tune.sh --bbrz
 sudo ./tune.sh --bbrv3      # reboot manually after a successful install
+sudo ./tune.sh --bbrv3 --allow-older-bbrv3-kernel  # explicit high-risk override
 ```
 
 ## SSH hardening safety

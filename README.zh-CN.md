@@ -71,6 +71,7 @@ sudo ./tune.sh -ts
 |---|---|
 | `-y`, `--yes` | 在脚本认为安全的 yes/no 确认处默认回答 yes。 |
 | `--dry-run` | 预览变更；命令会写入日志但不会执行。 |
+| `--allow-older-bbrv3-kernel` | 显式允许 BBRv3 payload 低于最高的已安装/运行中非 BBRv3 内核；`--yes` 不会隐含此选项。 |
 | `-v`, `--verbose` | 显示步骤进度、命令和生成的文件内容。 |
 | `--lang <en|zh-CN>` | 选择脚本输出语言：英文或简体中文。 |
 | `--zh-cn` | 等同于 `--lang zh-CN`。 |
@@ -93,11 +94,13 @@ sudo ./tune.sh -ts
 | BBRx | Debian 12 和 13 | 通过 DKMS 构建与发行版对应的 C 源码。 |
 | BBRy | Debian 或 Ubuntu | 尝试针对当前运行内核构建 DKMS；实际内核头文件/API 是最终兼容性判据。 |
 | BBRz | Debian 12 和 13 | 通过 DKMS 构建与发行版对应的 C 源码。 |
-| BBRv3 | 安装器支持：amd64 上的 Debian 11/12/13 和 Ubuntu 22.04/24.04/26.04；arm64 上的 Debian 13 | 安装预编译内核，完成后需手动重启进入新内核。 |
+| BBRv3 | 安装器支持：amd64 上的 Debian 11/12/13 和 Ubuntu 22.04/24.04/26.04；arm64 上的 Debian 13 | 安装已固定的 6.13.7 非 LTS 预编译内核，完成后需手动重启进入新内核。 |
 
 BBRx、BBRy 和 BBRz 源码固定在 `guowanghushifu/Seedbox-Components` 提交 `802fada1488bfbb9540a5740082d557aa88f8d6b`。脚本在 DKMS 处理源码之前校验硬编码 SHA-256，自行生成 `Makefile` 和 `dkms.conf`，加载模块，然后验证算法可用且已激活。脚本不会安排自动重启。
 
-BBRv3 使用 `jerry048/Dedicated-Seedbox` 安装器提交 `97470df47a948b0f39082e7679c630eaeff438d1`，安装器脚本本身也有固定 SHA-256。该安装器当前从持续变化的 `jerry048/Trove` `main` 分支获取内核包，但会先下载 `SHA256SUMS` 清单并校验选中的包。高级用户可使用 `TUNE_BBRV3_RAW_BASE` 覆盖该 payload 基址。
+BBRv3 使用 `jerry048/Dedicated-Seedbox` 安装器提交 `97470df47a948b0f39082e7679c630eaeff438d1`，安装器脚本本身也有固定 SHA-256。内核 payload 另外固定在 `jerry048/Trove` 提交 `8131d4b005c20ae1d73be545b1c5d8ebc435ad1`，并使用该提交中的 `SHA256SUMS` 校验选中的软件包。`TUNE_BBRV3_RAW_BASE` 只能指向该固定 payload 的完整镜像；包含其他内核版本的内容不受支持，因为安全检查以固定的 6.13.7 payload 为准。
+
+在下载安装器或修改软件包前，Tune 会把 6.13.7 payload 与以下版本中的最高值比较：当前运行的非 BBRv3 内核，以及已安装 `linux-image-*` 软件包中的非 BBRv3 内核。参考内核较新时会停止安装。`--yes` 不能绕过该检查；确实需要实验时，必须显式使用专用的 `--allow-older-bbrv3-kernel` 选项。dry-run 也会执行同一项只读检查并显示两个版本。
 
 安装完成后，Tune 会在生成的 GRUB 菜单中定位已安装的 BBRv3 内核，并用 `grub-reboot` 只选择下一次启动项。它不会修改永久 GRUB 默认项，也不会自动重启。当发行版内核版本号更高、原本会继续作为默认项时，这一步尤其必要；一次性进入 BBRv3 后，后续再次重启会回到发行版默认项，除非重新选择 BBRv3。
 
@@ -110,6 +113,7 @@ sudo ./tune.sh --dry-run --verbose --bbrx
 sudo ./tune.sh --bbry       # 大写短选项：-Y
 sudo ./tune.sh --bbrz
 sudo ./tune.sh --bbrv3      # 安装成功后手动重启
+sudo ./tune.sh --bbrv3 --allow-older-bbrv3-kernel  # 显式高风险覆盖
 ```
 
 ## SSH 加固安全流程
