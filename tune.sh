@@ -221,6 +221,7 @@ tr_text() {
         "Virtual machine or container detected; disk scheduler tuning is skipped.") printf '检测到虚拟机或容器，跳过磁盘调度器调优。' ;;
         "BBR kernel/DKMS installation is not supported inside a container.") printf '容器中不支持安装 BBR 内核/DKMS 组件。' ;;
         "BBRx and BBRz support Debian 12 and Debian 13 only.") printf 'BBRx 和 BBRz 仅支持 Debian 12 与 Debian 13。' ;;
+        "BBRy is not supported on Debian 13; install BBRx or BBRz instead.") printf 'Debian 13 不支持 BBRy；请改为安装 BBRx 或 BBRz。' ;;
         "The running kernel headers are unavailable after package installation.") printf '安装软件包后仍找不到当前运行内核的头文件。' ;;
         "The DKMS module build failed. Review the compiler output in the step log; a source/kernel API mismatch is one possible cause.") printf 'DKMS 模块构建失败。请查看步骤日志中的编译器输出；源码与内核 API 不匹配是可能原因之一。' ;;
         "The module was already loaded; reboot to ensure the rebuilt module binary is active.") printf '模块之前已加载；请重启以确保使用重新编译的模块文件。' ;;
@@ -287,7 +288,7 @@ usage() {
   -s, --ssh-security       加固 SSH，并安装/配置 fail2ban
   -t, --tune               应用内核/网络调优和周期性网络设备辅助服务
   -x, --bbrx               从固定并校验的源码安装 BBRx DKMS 模块
-  -Y, --bbry               从固定并校验的源码安装 BBRy DKMS 模块
+  -Y, --bbry               安装 BBRy DKMS 模块（Debian 13 不支持）
   -z, --bbrz               从固定并校验的源码安装 BBRz DKMS 模块
   -3, --bbrv3              通过固定并校验的 Dedicated 安装器安装 BBRv3 内核
 
@@ -330,7 +331,7 @@ Actions:
   -s, --ssh-security       Harden SSH and install/configure fail2ban
   -t, --tune               Apply kernel/network tuning and periodic netdev helper
   -x, --bbrx               Install BBRx DKMS from pinned, verified source
-  -Y, --bbry               Install BBRy DKMS from pinned, verified source
+  -Y, --bbry               Install BBRy DKMS (not supported on Debian 13)
   -z, --bbrz               Install BBRz DKMS from pinned, verified source
   -3, --bbrv3              Install a BBRv3 kernel via the pinned, verified Dedicated installer
 
@@ -1541,6 +1542,10 @@ resolve_bbr_source() {
         bbrz:debian:13)
             source_file="tcp_bbrz_debian13.c"
             sha256="9e475cd34138663fe834b77acf4c98306df6fa2a654dc5a3fe75b526b80a6c51"
+            ;;
+        bbry:debian:13)
+            error "BBRy is not supported on Debian 13; install BBRx or BBRz instead."
+            return 1
             ;;
         bbry:debian:*|bbry:ubuntu:*)
             source_file="tcp_bbry.c"

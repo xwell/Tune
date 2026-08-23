@@ -55,7 +55,7 @@ sudo ./tune.sh --en --help
 | `-s` | `--ssh-security` | 加固 SSH、更改 SSH 端口、可选禁用密码登录，并配置 `fail2ban`。 |
 | `-t` | `--tune` | 应用内核/网络调优，并安装周期性网络辅助服务。 |
 | `-x` | `--bbrx` | 从固定并校验的源码通过 DKMS 构建安装 BBRx。 |
-| `-Y` | `--bbry` | 从固定并校验的源码通过 DKMS 构建安装 BBRy。 |
+| `-Y` | `--bbry` | 从固定并校验的源码通过 DKMS 构建安装 BBRy；Debian 13 不可用。 |
 | `-z` | `--bbrz` | 从固定并校验的源码通过 DKMS 构建安装 BBRz。 |
 | `-3` | `--bbrv3` | 通过固定并校验的 Dedicated 安装器安装 BBRv3 内核。 |
 
@@ -92,11 +92,13 @@ sudo ./tune.sh -ts
 | 变体 | 支持系统 | 安装行为 |
 |---|---|---|
 | BBRx | Debian 12 和 13 | 通过 DKMS 构建与发行版对应的 C 源码。 |
-| BBRy | Debian 或 Ubuntu | 尝试针对当前运行内核构建 DKMS；实际内核头文件/API 是最终兼容性判据。 |
+| BBRy | 除 Debian 13 外的 Debian；Ubuntu | 尝试针对当前运行内核构建 DKMS；实际内核头文件/API 是最终兼容性判据。 |
 | BBRz | Debian 12 和 13 | 通过 DKMS 构建与发行版对应的 C 源码。 |
 | BBRv3 | 安装器支持：amd64 上的 Debian 11/12/13 和 Ubuntu 22.04/24.04/26.04；arm64 上的 Debian 13 | 安装已固定的 6.13.7 非 LTS 预编译内核，完成后需手动重启进入新内核。 |
 
 BBRx、BBRy 和 BBRz 源码固定在 `guowanghushifu/Seedbox-Components` 提交 `802fada1488bfbb9540a5740082d557aa88f8d6b`。脚本在 DKMS 处理源码之前校验硬编码 SHA-256，自行生成 `Makefile` 和 `dkms.conf`，加载模块，然后验证算法可用且已激活。脚本不会安排自动重启。
+
+在 Debian 13 上，固定的 BBRy 源码与实测内核 API 不兼容，因此 Tune 会在安装软件包或下载源码前拒绝 BBRy，并建议改为安装 BBRx 或 BBRz。
 
 BBRv3 使用 `jerry048/Dedicated-Seedbox` 安装器提交 `97470df47a948b0f39082e7679c630eaeff438d1`，安装器脚本本身也有固定 SHA-256。内核 payload 另外固定在 `jerry048/Trove` 提交 `8131d4b005c20ae1d73be545b1c5d8ebc435ad1`，并使用该提交中的 `SHA256SUMS` 校验选中的软件包。`TUNE_BBRV3_RAW_BASE` 只能指向该固定 payload 的完整镜像；包含其他内核版本的内容不受支持，因为安全检查以固定的 6.13.7 payload 为准。
 

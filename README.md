@@ -30,7 +30,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/xwell/Tune/main/tune.sh) --dr
 | `-s` | `--ssh-security` | Hardens SSH, changes the SSH port, optionally disables password login, and configures `fail2ban`. |
 | `-t` | `--tune` | Applies kernel/network tuning and installs a periodic network helper. |
 | `-x` | `--bbrx` | Builds and installs BBRx through DKMS from pinned, verified source. |
-| `-Y` | `--bbry` | Builds and installs BBRy through DKMS from pinned, verified source. |
+| `-Y` | `--bbry` | Builds and installs BBRy through DKMS from pinned, verified source; unavailable on Debian 13. |
 | `-z` | `--bbrz` | Builds and installs BBRz through DKMS from pinned, verified source. |
 | `-3` | `--bbrv3` | Installs a BBRv3 kernel through the pinned, verified Dedicated installer. |
 
@@ -66,11 +66,13 @@ sudo ./tune.sh -ts
 | Variant | Supported systems | Installation behavior |
 |---|---|---|
 | BBRx | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
-| BBRy | Debian or Ubuntu | Attempts a DKMS build against the running kernel; the actual kernel headers/API are the final compatibility check. |
+| BBRy | Debian except 13; Ubuntu | Attempts a DKMS build against the running kernel; the actual kernel headers/API are the final compatibility check. |
 | BBRz | Debian 12 and 13 | Builds the distro-specific C source through DKMS. |
 | BBRv3 | Installer support: Debian 11/12/13 and Ubuntu 22.04/24.04/26.04 on amd64; Debian 13 on arm64 | Installs the pinned prebuilt 6.13.7 non-LTS kernel and requires a reboot into that kernel. |
 
 BBRx, BBRy, and BBRz sources are pinned to `guowanghushifu/Seedbox-Components` commit `802fada1488bfbb9540a5740082d557aa88f8d6b`. The script verifies a hard-coded SHA-256 before DKMS sees the source, creates its own `Makefile` and `dkms.conf`, loads the module, and verifies both availability and the active congestion-control setting. It does not schedule a reboot.
+
+On Debian 13, Tune rejects BBRy before installing packages or downloading source because the pinned BBRy source is incompatible with the tested kernel API. Install BBRx or BBRz instead.
 
 BBRv3 uses `jerry048/Dedicated-Seedbox` installer commit `97470df47a948b0f39082e7679c630eaeff438d1`, whose script SHA-256 is also pinned. Its kernel payload is pinned separately to `jerry048/Trove` commit `8131d4b005c20ae1d73be545b1c5d8ebc435ad1`; the selected package is verified against that commit's `SHA256SUMS` manifest. `TUNE_BBRV3_RAW_BASE` may point to an exact mirror of this pinned payload. Content containing a different kernel version is unsupported because the safety check assumes the pinned 6.13.7 payload.
 
